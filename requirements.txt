@@ -1,0 +1,40 @@
+# PointCam Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core ML/CV
+ultralytics>=8.0.0          # YOLOv8
+paddlepaddle>=2.5.0         # PaddlePaddle (CPU version, use paddlepaddle-gpu for GPU)
+paddleocr>=2.7.0            # PaddleOCR
+opencv-python>=4.8.0        # OpenCV
+numpy>=1.24.0               # Numerical computing
+
+# Dataset handling
+pycocotools>=2.0.0          # COCO format tools
+
+# Visualization & analysis
+matplotlib>=3.7.0           # Plotting
+seaborn>=0.12.0             # Statistical visualization
+pillow>=10.0.0              # Image handling
+
+# Web UI (Phase 3+)
+# fastapi>=0.100.0
+# uvicorn>=0.23.0
+# jinja2>=3.1.0
+
+# Database
+# sqlite handled by Python stdlib
+
+# Utilities
+pyyaml>=6.0                 # Configuration files
+tqdm>=4.65.0                # Progress bars
+python-dateutil>=2.8.0      # Date handling
+
+# Development
+pytest>=7.4.0               # Testing
+pytest-cov>=4.1.0           # Coverage
+black>=23.0.0               # Code formatting
+ruff>=0.1.0                 # Linting
+
+# Jupyter (optional, for experimentation)
+jupyter>=1.0.0
+ipywidgets>=8.0.0

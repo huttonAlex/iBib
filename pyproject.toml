@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pointcam"
+version = "0.1.0"
+description = "Computer vision-based race timing backup system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+authors = [
+    {name = "PointCam Team"}
+]
+keywords = ["race timing", "computer vision", "bib detection", "OCR"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "ultralytics>=8.0.0",
+    "paddlepaddle>=2.5.0",
+    "paddleocr>=2.7.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "pycocotools>=2.0.0",
+    "matplotlib>=3.7.0",
+    "pillow>=10.0.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+gpu = [
+    "paddlepaddle-gpu>=2.5.0",
+]
+
+[project.scripts]
+pointcam-validate = "pointcam.scripts.validate_dataset:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+include = '\.pyi?$'
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
