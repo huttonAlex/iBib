@@ -2,38 +2,47 @@
 
 This directory contains the training data for PointCam bib detection.
 
-## Expected Structure
+## Current Dataset
+
+- **Total images**: 221
+- **Train split**: 176 images (80%), 294 annotations
+- **Val split**: 45 images (20%), 78 annotations
+- **Category**: "Bib" (id: 0)
+- **Image size**: 398x600 pixels
+
+## Directory Structure
 
 ```
 data/
-├── images/              # All image files
-│   ├── image001.jpg
-│   ├── image002.jpg
-│   └── ...
-├── annotations/         # COCO format annotations
-│   └── instances.json   # Main annotations file
-└── README.md           # This file
+├── images/
+│   ├── train/           # Training images (176)
+│   └── val/             # Validation images (45)
+├── annotations/
+│   ├── annotations.json # Full dataset annotations
+│   ├── train.json       # Training split annotations
+│   └── val.json         # Validation split annotations
+└── README.md
 ```
 
 ## COCO Annotation Format
 
-The `instances.json` file should follow COCO format:
+All annotation files follow COCO format:
 
 ```json
 {
   "images": [
     {
-      "id": 1,
+      "id": 0,
       "file_name": "image001.jpg",
-      "width": 1920,
-      "height": 1080
+      "width": 398,
+      "height": 600
     }
   ],
   "annotations": [
     {
-      "id": 1,
-      "image_id": 1,
-      "category_id": 1,
+      "id": 0,
+      "image_id": 0,
+      "category_id": 0,
       "bbox": [x, y, width, height],
       "area": 12345,
       "iscrowd": 0
@@ -41,22 +50,18 @@ The `instances.json` file should follow COCO format:
   ],
   "categories": [
     {
-      "id": 1,
-      "name": "bib",
-      "supercategory": "race"
+      "id": 0,
+      "name": "Bib"
     }
   ]
 }
 ```
 
-## Loading Your Dataset
+## Usage
 
-1. Copy your images to `data/images/`
-2. Copy your COCO annotations to `data/annotations/instances.json`
-3. Run validation:
-   ```bash
-   python scripts/validate_dataset.py --images data/images --annotations data/annotations/instances.json
-   ```
+For YOLOv8 training, use the pre-split data:
+- Images: `data/images/train/` and `data/images/val/`
+- Annotations: `data/annotations/train.json` and `data/annotations/val.json`
 
 ## Notes
 

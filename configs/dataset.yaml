@@ -1,0 +1,12 @@
+# YOLOv8 Dataset Configuration for PointCam Bib Detection
+
+path: /mnt/c/Users/alex/Projects/pointCam/data  # Dataset root directory (absolute)
+train: images/train
+val: images/val
+
+# Labels are automatically found in labels/train and labels/val
+# (YOLOv8 replaces 'images' with 'labels' in the path)
+
+# Class names
+names:
+  0: bib
