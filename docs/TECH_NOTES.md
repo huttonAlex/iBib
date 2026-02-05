@@ -123,7 +123,57 @@ achieving diversity across multiple events.
 
 ### Milestone 1.2: Static Image Processing
 
-*Awaiting first entries*
+### Entry 2026-02-04: Phase 2.1 OCR Fine-Tuning Pipeline Setup
+
+**Phase/Milestone**: 1.2 - Static Image Processing / OCR Model Evaluation
+
+**Objective**:
+Build the tooling infrastructure for evaluating and fine-tuning specialized OCR models
+on the 10,853 verified bib crop dataset, targeting 90%+ accuracy (up from 52.7% EasyOCR baseline).
+
+**Method**:
+- Created 4 scripts for the full evaluate-train-export workflow
+- Added `ocr-eval` dependency group to `pyproject.toml` (torch, transformers, etc.)
+- Designed stratified dataset split ensuring all events in every split
+- Selected 3 candidate models spanning the accuracy-vs-speed tradeoff space
+
+**Scripts Created**:
+| Script | Purpose |
+|--------|---------|
+| `scripts/prepare_ocr_dataset.py` | Consolidate 5 sources into unified train/val/test with augmentation |
+| `scripts/evaluate_ocr_models.py` | Baseline + fine-tuned model evaluation with full metrics |
+| `scripts/finetune_ocr.py` | Fine-tune CRNN, PARSeq, TrOCR with model-specific strategies |
+| `scripts/export_ocr_model.py` | ONNX export with accuracy verification and speed benchmarking |
+
+**Key Design Choices**:
+- **Stratified split within each event**: Prevents train/test leakage and ensures
+  generalization is measurable. Every event appears in train, val, and test.
+- **Three model tiers**: CRNN (8.3M, edge-friendly), PARSeq (23.8M, SOTA accuracy),
+  TrOCR (62M, strong pretrained). All three fine-tuned since CPU training time is not a constraint.
+- **Online augmentation**: Applied during training (not pre-generated) to maximize
+  effective diversity. Pipeline: rotation, motion blur, brightness/contrast, perspective,
+  noise, downscale.
+- **Minority oversampling**: 1-digit bibs (50 samples) get 10x augmentation, 2-digit 5x,
+  3-digit 2x. 4-digit bibs (76.7% of data) get no extra copies.
+- **Common model interface**: `predict(image) -> (str, float)` allows uniform evaluation
+  and easy model swapping in the pipeline.
+- **ONNX export**: Opset 17 with dynamic batch axis, accuracy parity check (within 1%),
+  speed benchmarking. Targets RPi 5 (ONNX Runtime) and Jetson (TensorRT via ONNX).
+
+**Execution Plan**:
+1. Install deps: `pip install -e .[ocr-eval]`
+2. Prepare dataset: `python scripts/prepare_ocr_dataset.py`
+3. Baseline eval: `python scripts/evaluate_ocr_models.py --models trocr parseq`
+4. Fine-tune: `python scripts/finetune_ocr.py --model {crnn,parseq,trocr}`
+5. Re-evaluate fine-tuned checkpoints
+6. Export winner to ONNX
+
+**Implications for Project**:
+- Phase 2.1 tooling is complete; ready to execute the evaluation/training pipeline
+- EasyOCR and PaddleOCR will be replaced by the fine-tuned model in Phase 3
+- CRNN is the most deployment-friendly candidate (smallest, grayscale input, fastest)
+  but PARSeq may win on accuracy
+- CPU-only training means fine-tuning will be slow but feasible for all three models
 
 ---
 
@@ -249,3 +299,4 @@ Track performance measurements across phases:
 | E004 | 2026-02-03 | 1.1 | Unlabeled data annotation | 1,565 verified crops | Single event, review UI |
 | E005 | 2026-02-04 | 1.1 | Tagged photo processing | 9,288 verified crops | 3 events via scoring provider |
 | E006 | 2026-02-04 | 1.1 | Combined dataset | 10,853 total verified | 4 events, 6 cameras, 1-4 digit bibs |
+| E007 | 2026-02-04 | 1.2 | Phase 2.1 pipeline setup | Tooling complete | 4 scripts, 3 candidate models |

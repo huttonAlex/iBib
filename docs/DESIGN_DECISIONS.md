@@ -446,7 +446,7 @@ This document tracks key technical decisions, alternatives considered, and ratio
 - Lightweight model for edge deployment
 - Consider custom training if accuracy insufficient
 
-**Status**: Accepted
+**Status**: Superseded by DD-018
 **Date**: 2026-02-01
 
 ---
@@ -508,6 +508,41 @@ This document tracks key technical decisions, alternatives considered, and ratio
 
 **Status**: Accepted
 **Date**: 2026-02-01
+
+---
+
+### DD-018: Fine-Tuned Scene Text Recognition for OCR
+
+**Decision**: Replace general-purpose OCR (EasyOCR/PaddleOCR) with a fine-tuned scene text
+recognition model, evaluated across CRNN, PARSeq, and TrOCR candidates
+
+**Context**: EasyOCR baseline achieved only 52.7% accuracy on bib crops (Phase 1 testing).
+PaddleOCR (DD-015) was the original plan but was never deployed. With 10,853 verified bib
+crops now available, fine-tuning a specialized model is feasible and likely to exceed 90%.
+
+**Alternatives Considered**:
+1. Keep EasyOCR with better preprocessing - Limited ceiling (~60-65%)
+2. PaddleOCR PP-OCRv4 (pretrained) - Better than EasyOCR but still general-purpose
+3. Fine-tune PaddleOCR SVTR - Tied to PaddlePaddle ecosystem
+4. Fine-tune PyTorch scene text models (CRNN/PARSeq/TrOCR) - Best accuracy, ONNX portable
+
+**Rationale**:
+- General-purpose OCR fails on bib-specific challenges (small crops, angled text, header confusion)
+- 10,853 labeled crops is sufficient for fine-tuning (exceeds 3,000 minimum by 3.6x)
+- PyTorch models export to ONNX, deployable on both Jetson (TensorRT) and RPi 5 (ONNX Runtime)
+- Three candidates cover the accuracy-vs-speed tradeoff: CRNN (8.3M, fastest), PARSeq
+  (23.8M, best accuracy/speed), TrOCR (62M, strongest pretrained features)
+- Digit-only vocabulary (10 digits + control tokens) dramatically reduces output space
+- Fine-tuned model eliminates PaddlePaddle dependency (simplifies deployment)
+
+**Consequences**:
+- Adds PyTorch + transformers as training dependencies (in `ocr-eval` optional group)
+- Deployment uses only ONNX Runtime (no PyTorch needed on device)
+- Model selection depends on Phase 2.1 evaluation results
+- May need retraining as new event data is collected (continuous improvement pipeline)
+
+**Status**: Accepted
+**Date**: 2026-02-04
 
 ---
 

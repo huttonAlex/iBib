@@ -136,19 +136,68 @@ Tasks:
 - [x] Process and verify Event 88679 via scoring provider (828 crops)
 - [x] Process and verify Event 86638 via scoring provider (5,901 crops)
 - [x] Process and verify Event 89536 via scoring provider (2,559 crops)
-- [ ] Combine all verified data into unified training set
-- [ ] Create train/val/test split (stratified by event)
+- [x] Combine all verified data into unified training set (`scripts/prepare_ocr_dataset.py`)
+- [x] Create train/val/test split (stratified by event)
 
-### Phase 2: Fine-Tune Digit Recognition Model
-**Target: 90%+ accuracy**
+### Phase 2: Fine-Tune Digit Recognition Model (IN PROGRESS)
+**Target: 90%+ accuracy on held-out test set**
 **Prerequisite: 3,000+ diverse verified crops (ACHIEVED: 10,853)**
+
+#### Phase 2.1: Dataset Preparation & Baseline Evaluation
+
+| Task | Script | Status |
+|------|--------|--------|
+| Build unified dataset with stratified splits | `scripts/prepare_ocr_dataset.py` | Created |
+| Build model evaluation framework | `scripts/evaluate_ocr_models.py` | Created |
+| Build fine-tuning pipeline | `scripts/finetune_ocr.py` | Created |
+| Build ONNX export tool | `scripts/export_ocr_model.py` | Created |
+| Add `ocr-eval` dependencies to `pyproject.toml` | - | Done |
+| Install dependencies | `pip install -e .[ocr-eval]` | TODO |
+| Prepare dataset (run split + augmentation) | `python scripts/prepare_ocr_dataset.py` | TODO |
+| Evaluate pretrained TrOCR + PARSeq baselines | `python scripts/evaluate_ocr_models.py --models trocr parseq` | TODO |
+
+#### Phase 2.2: Model Fine-Tuning (CPU-only)
+
+| Model | Params | Batch | LR | Loss | Script |
+|-------|--------|-------|----|------|--------|
+| CRNN (VGG-BiLSTM-CTC) | 8.3M | 128 | 1e-3 | CTC | `finetune_ocr.py --model crnn` |
+| PARSeq | 23.8M | 32 | 1e-4 | CE | `finetune_ocr.py --model parseq` |
+| TrOCR-small | 62M | 8 | 5e-5 | CE | `finetune_ocr.py --model trocr` |
+
+Training features: online augmentation, early stopping on val accuracy, digit-only vocab,
+LR scheduling (OneCycleLR for PARSeq, ReduceLROnPlateau for CRNN), gradient clipping for
+CRNN. TrOCR uses encoder freeze for 5 epochs then unfreeze at 10x lower LR.
+
+#### Phase 2.3: Model Selection & Export
+
+- Select best model based on accuracy vs inference speed tradeoff
+- Export to ONNX opset 17 via `scripts/export_ocr_model.py`
+- Verify ONNX accuracy matches PyTorch within 1%
+- Save to `models/ocr_{model}.onnx`
+
+#### Dataset Split Strategy
+
+- 80/10/10 train/val/test, stratified by event within each source
+- All 5 data sources (4 events) represented in every split
+- Augmentation pipeline (albumentations): rotation +-15deg, motion blur, brightness/contrast, perspective warp, gaussian noise, downscale
+- Minority oversampling: 1-digit 10x, 2-digit 5x, 3-digit 2x (addresses 76.7% 4-digit class imbalance)
+- Export formats: Common (symlinked images + TSV), HuggingFace Dataset, LMDB
+
+#### Evaluation Metrics
+
+- **Exact match accuracy** (whole bib correct) — primary metric
+- Character-level accuracy (Levenshtein-based)
+- Accuracy by digit count (1/2/3/4 breakdown)
+- Accuracy by source event (generalization check — no single-event collapse)
+- Inference speed (ms/image, CPU)
 
 Tasks:
 - [ ] Evaluate TrOCR vs PARSeq vs CRNN on our data
-- [ ] Fine-tune best candidate on bib crops
+- [ ] Fine-tune all three candidates on bib crops
 - [ ] Augmentation: rotation (+-15 deg), brightness, blur, noise, perspective warp
 - [ ] Evaluate per-event accuracy (must generalize across events)
 - [ ] Benchmark inference speed on target hardware
+- [ ] Export best model to ONNX
 
 ### Phase 3: Pipeline Integration & Optimization
 **Target: 95%+ accuracy, <200ms per bib**

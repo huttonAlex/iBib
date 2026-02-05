@@ -6,42 +6,50 @@ This roadmap outlines the development path for PointCam from proof-of-concept to
 
 **Team**: Small team (2-5 people)
 **Business Model**: Product for sale/license
-**Current Status**: Planning & Documentation
+**Current Status**: Phase 1.2 - Custom Model Training (OCR fine-tuning)
 
 ---
 
 ## Phase 1: Proof of Concept
 **Goal**: Validate core CV technologies using existing dataset
 
-### Milestone 1.1: Baseline Evaluation ✓ Dataset Available
-**Status**: Ready to start
-**Assets**: 1000 tagged images in COCO format
+### Milestone 1.1: Baseline Evaluation (COMPLETE)
+**Status**: Complete
+**Assets**: 1000 tagged images in COCO format, 10,853 verified bib crops from 4 events
 
 **Deliverables:**
-- [ ] Evaluate existing dataset for training/test split
-- [ ] Benchmark off-the-shelf bib detection models
-- [ ] Benchmark OCR solutions on cropped bibs
-- [ ] Document baseline accuracy metrics
-- [ ] Identify dataset gaps (if any)
+- [x] Evaluate existing dataset for training/test split
+- [x] Benchmark off-the-shelf bib detection models (YOLOv8 Nano: 97.3% mAP50)
+- [x] Benchmark OCR solutions on cropped bibs (EasyOCR: 52.7%, TrOCR: tested)
+- [x] Document baseline accuracy metrics
+- [x] Identify dataset gaps → collected 10,853 crops from 4 events (3.6x target)
 
-**Success Criteria:**
-- Dataset quality validated (annotations correct, diversity adequate)
-- Baseline bib detection mAP measured
-- Baseline OCR accuracy measured
-- Clear go/no-go for Phase 1.2
+**Results:**
+- Detection: 97.3% mAP50 — production-ready
+- OCR: 52.7% (EasyOCR) — bottleneck, requires fine-tuned model
+- Data: 10,853 verified crops, 4 events, 6 camera positions, 1-4 digit bibs
 
 ---
 
-### Milestone 1.2: Custom Model Training
+### Milestone 1.2: Custom Model Training (IN PROGRESS)
+**Status**: OCR fine-tuning pipeline built, ready to execute
+
 **Deliverables:**
-- [ ] Train YOLOv8 bib detector on dataset
-- [ ] Evaluate OCR pipeline on detected bibs
-- [ ] Measure end-to-end detection → OCR accuracy
+- [x] Train YOLOv8 bib detector on dataset (97.3% mAP50 — done)
+- [x] Build OCR evaluation framework (`scripts/evaluate_ocr_models.py`)
+- [x] Build dataset preparation pipeline (`scripts/prepare_ocr_dataset.py`)
+- [x] Build fine-tuning pipeline (`scripts/finetune_ocr.py`)
+- [x] Build ONNX export tool (`scripts/export_ocr_model.py`)
+- [ ] Prepare unified dataset with stratified splits
+- [ ] Evaluate pretrained baselines (TrOCR, PARSeq)
+- [ ] Fine-tune CRNN, PARSeq, TrOCR on 10,853 bib crops
+- [ ] Select best model and export to ONNX
+- [ ] Measure end-to-end detection + OCR accuracy
 - [ ] Document model performance vs requirements
 
 **Success Criteria:**
-- Bib detection mAP > 0.85 on test set
-- OCR accuracy > 80% on static detected bibs
+- Bib detection mAP > 0.85 on test set (ACHIEVED: 97.3%)
+- OCR accuracy > 80% on static detected bibs (target: 90%+)
 - Clear understanding of failure cases
 
 ---
@@ -455,7 +463,8 @@ This roadmap outlines the development path for PointCam from proof-of-concept to
 
 ### Phase 1 Prerequisites
 - [x] COCO dataset available (1000 images)
-- [ ] Development environment setup
+- [x] Development environment setup
+- [x] OCR training data collected (10,853 verified crops)
 - [ ] Access to scoring software for integration testing
 
 ### Phase 2 Prerequisites
