@@ -43,8 +43,7 @@ env/
 *.ipynb_checkpoints
 
 # Data - DO NOT COMMIT LARGE FILES
-data/images/
-data/annotations/
+data/
 *.jpg
 *.jpeg
 *.png
@@ -54,6 +53,9 @@ data/annotations/
 *.mp4
 *.avi
 *.mov
+
+# Training runs and outputs
+runs/
 
 # Models - DO NOT COMMIT LARGE FILES
 models/*.pt
