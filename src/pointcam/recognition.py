@@ -747,6 +747,7 @@ class CropQuality:
     blur_score: float  # Higher = sharper (Laplacian variance)
     aspect_ratio: float
     pixel_count: int
+    completeness_score: float = 1.0  # 0-1, lower means likely partial/obstructed
     rejection_reason: Optional[str] = None
 
 
@@ -759,6 +760,7 @@ class CropQualityFilter:
     - Minimum size
     - Aspect ratio (bibs are roughly 2:1 to 4:1 width:height)
     - Minimum contrast
+    - Completeness (detect partial/obstructed bibs)
 
     Requires: cv2, numpy
     """
@@ -771,6 +773,8 @@ class CropQualityFilter:
         min_aspect_ratio: float = 1.0,
         max_aspect_ratio: float = 6.0,
         min_contrast: float = 20.0,
+        min_completeness: float = 0.6,
+        check_completeness: bool = True,
     ):
         if not CV2_AVAILABLE:
             raise ImportError("CropQualityFilter requires cv2 and numpy")
@@ -782,6 +786,8 @@ class CropQualityFilter:
             min_aspect_ratio: Minimum width/height ratio
             max_aspect_ratio: Maximum width/height ratio
             min_contrast: Minimum standard deviation of pixel values
+            min_completeness: Minimum completeness score (0-1)
+            check_completeness: Enable completeness checking
         """
         self.min_blur_score = min_blur_score
         self.min_width = min_width
@@ -789,6 +795,8 @@ class CropQualityFilter:
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
         self.min_contrast = min_contrast
+        self.min_completeness = min_completeness
+        self.check_completeness = check_completeness
 
     def assess(self, crop: Any) -> CropQuality:
         """
@@ -881,11 +889,27 @@ class CropQualityFilter:
                 rejection_reason=f"Low contrast: {contrast:.1f} < {self.min_contrast}",
             )
 
+        # Completeness check (detect partial/obstructed bibs)
+        completeness_score = 1.0
+        if self.check_completeness:
+            completeness_score = self._assess_completeness(gray)
+
+            if completeness_score < self.min_completeness:
+                return CropQuality(
+                    is_acceptable=False,
+                    blur_score=blur_score,
+                    aspect_ratio=aspect_ratio,
+                    pixel_count=pixel_count,
+                    completeness_score=completeness_score,
+                    rejection_reason=f"Likely partial/obstructed: {completeness_score:.2f} < {self.min_completeness}",
+                )
+
         return CropQuality(
             is_acceptable=True,
             blur_score=blur_score,
             aspect_ratio=aspect_ratio,
             pixel_count=pixel_count,
+            completeness_score=completeness_score,
             rejection_reason=None,
         )
 
@@ -900,6 +924,219 @@ class CropQualityFilter:
             True if crop should be processed, False to skip
         """
         return self.assess(crop).is_acceptable
+
+    def _assess_completeness(self, gray: Any) -> float:
+        """
+        Assess whether a bib crop appears complete vs partial/obstructed.
+
+        Checks for signs of partial visibility:
+        1. Edge intensity - text at crop edges suggests truncation
+        2. Margin analysis - complete bibs have margins around text
+        3. Symmetry - partial bibs often have asymmetric content
+
+        Args:
+            gray: Grayscale image of crop
+
+        Returns:
+            Completeness score from 0.0 (definitely partial) to 1.0 (complete)
+        """
+        h, w = gray.shape[:2]
+        scores = []
+
+        # 1. Edge margin check - complete bibs should have some margin
+        # Check if there's high-contrast content at the very edges
+        edge_width = max(3, w // 20)
+        edge_height = max(2, h // 10)
+
+        # Left edge
+        left_edge = gray[:, :edge_width]
+        left_intensity = float(np.std(left_edge))
+
+        # Right edge
+        right_edge = gray[:, -edge_width:]
+        right_intensity = float(np.std(right_edge))
+
+        # Center region (for comparison)
+        center = gray[:, w//4:3*w//4]
+        center_intensity = float(np.std(center))
+
+        # If edges have similar intensity to center, likely truncated
+        if center_intensity > 10:  # Only check if there's content
+            left_ratio = left_intensity / center_intensity
+            right_ratio = right_intensity / center_intensity
+
+            # High ratio at edge = likely text at edge = truncated
+            edge_score = 1.0
+            if left_ratio > 0.8:
+                edge_score -= 0.3
+            if right_ratio > 0.8:
+                edge_score -= 0.3
+            scores.append(max(0.0, edge_score))
+
+        # 2. Vertical edge check (for occlusion from top/bottom)
+        top_edge = gray[:edge_height, :]
+        bottom_edge = gray[-edge_height:, :]
+
+        top_intensity = float(np.std(top_edge))
+        bottom_intensity = float(np.std(bottom_edge))
+
+        if center_intensity > 10:
+            top_ratio = top_intensity / center_intensity
+            bottom_ratio = bottom_intensity / center_intensity
+
+            vert_score = 1.0
+            if top_ratio > 0.9:
+                vert_score -= 0.2
+            if bottom_ratio > 0.9:
+                vert_score -= 0.2
+            scores.append(max(0.0, vert_score))
+
+        # 3. Content distribution check
+        # Divide into thirds and check for content in each
+        third_w = w // 3
+        left_third = gray[:, :third_w]
+        center_third = gray[:, third_w:2*third_w]
+        right_third = gray[:, 2*third_w:]
+
+        left_content = float(np.std(left_third))
+        center_content = float(np.std(center_third))
+        right_content = float(np.std(right_third))
+
+        max_content = max(left_content, center_content, right_content)
+        if max_content > 10:
+            # All thirds should have some content for complete bib
+            min_content = min(left_content, center_content, right_content)
+            distribution_score = min_content / max_content
+            scores.append(distribution_score)
+
+        # 4. Gradient check at edges (sharp cutoff suggests truncation)
+        # Use Sobel to detect vertical edges
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+
+        left_gradient = float(np.abs(sobel_x[:, :edge_width]).mean())
+        right_gradient = float(np.abs(sobel_x[:, -edge_width:]).mean())
+        inner_gradient = float(np.abs(sobel_x[:, edge_width:-edge_width]).mean())
+
+        if inner_gradient > 5:
+            # High gradient at edges compared to inner suggests occlusion edge
+            gradient_score = 1.0
+            if left_gradient > inner_gradient * 1.5:
+                gradient_score -= 0.25
+            if right_gradient > inner_gradient * 1.5:
+                gradient_score -= 0.25
+            scores.append(max(0.0, gradient_score))
+
+        # Combine scores
+        if not scores:
+            return 1.0
+
+        return float(np.mean(scores))
+
+
+class BibCompletenessChecker:
+    """
+    Additional check for bib completeness based on detection box position.
+
+    Use this with frame-level context to reject bibs that:
+    - Are at frame edges (entering/exiting)
+    - Have detection boxes touching boundaries
+    """
+
+    def __init__(
+        self,
+        edge_margin_ratio: float = 0.02,
+        min_visible_ratio: float = 0.9,
+    ):
+        """
+        Args:
+            edge_margin_ratio: Margin from frame edge as ratio of frame size
+            min_visible_ratio: Minimum portion of expected bib that should be visible
+        """
+        self.edge_margin_ratio = edge_margin_ratio
+        self.min_visible_ratio = min_visible_ratio
+
+    def is_fully_visible(
+        self,
+        bbox: Tuple[int, int, int, int],
+        frame_width: int,
+        frame_height: int,
+    ) -> Tuple[bool, str]:
+        """
+        Check if detection box is fully within frame (not at edges).
+
+        Args:
+            bbox: (x1, y1, x2, y2) bounding box
+            frame_width: Frame width in pixels
+            frame_height: Frame height in pixels
+
+        Returns:
+            (is_visible, reason) tuple
+        """
+        x1, y1, x2, y2 = bbox
+
+        margin_x = int(frame_width * self.edge_margin_ratio)
+        margin_y = int(frame_height * self.edge_margin_ratio)
+
+        # Check if bbox touches frame edges
+        at_left = x1 <= margin_x
+        at_right = x2 >= frame_width - margin_x
+        at_top = y1 <= margin_y
+        at_bottom = y2 >= frame_height - margin_y
+
+        if at_left:
+            return False, "Bib at left edge (possibly entering frame)"
+        if at_right:
+            return False, "Bib at right edge (possibly exiting frame)"
+        if at_top:
+            return False, "Bib at top edge"
+        if at_bottom:
+            return False, "Bib at bottom edge"
+
+        return True, "Fully visible"
+
+    def check_with_tracking(
+        self,
+        bbox: Tuple[int, int, int, int],
+        frame_width: int,
+        frame_height: int,
+        previous_bbox: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Tuple[bool, float, str]:
+        """
+        Check visibility with tracking context.
+
+        If we have previous bbox, we can estimate if the bib is
+        fully in frame vs partially visible.
+
+        Args:
+            bbox: Current bounding box
+            frame_width: Frame width
+            frame_height: Frame height
+            previous_bbox: Previous frame's bbox (if tracked)
+
+        Returns:
+            (is_complete, confidence, reason)
+        """
+        is_visible, reason = self.is_fully_visible(bbox, frame_width, frame_height)
+
+        if not is_visible:
+            return False, 0.0, reason
+
+        # If we have previous bbox, check for sudden size changes
+        # (might indicate partial visibility)
+        if previous_bbox is not None:
+            prev_w = previous_bbox[2] - previous_bbox[0]
+            prev_h = previous_bbox[3] - previous_bbox[1]
+            curr_w = bbox[2] - bbox[0]
+            curr_h = bbox[3] - bbox[1]
+
+            # Significant size decrease might mean partial occlusion
+            width_ratio = curr_w / max(prev_w, 1)
+            height_ratio = curr_h / max(prev_h, 1)
+
+            if width_ratio < 0.7 or height_ratio < 0.7:
+                return False, 0.5, f"Sudden size decrease (w:{width_ratio:.2f}, h:{height_ratio:.2f})"
+
+        return True, 1.0, "Complete"
 
 
 # ---------------------------------------------------------------------------

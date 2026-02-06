@@ -41,6 +41,7 @@ from pointcam.recognition import (
     CropQualityFilter,
     PostOCRCleanup,
     DigitCountValidator,
+    BibCompletenessChecker,
 )
 
 
@@ -278,7 +279,14 @@ def process_video(
         min_height=15,
         min_aspect_ratio=1.0,
         max_aspect_ratio=6.0,
+        min_completeness=0.6,
+        check_completeness=True,
     ) if enable_quality_filter else None
+
+    # Completeness checker for frame-edge detection
+    completeness_checker = BibCompletenessChecker(
+        edge_margin_ratio=0.02,  # 2% margin from frame edges
+    )
 
     post_cleanup = PostOCRCleanup(
         min_digits=1,
@@ -345,6 +353,8 @@ def process_video(
     total_ocr_time = 0.0
     total_det_time = 0.0
     quality_rejected = 0
+    edge_rejected = 0
+    partial_rejected = 0
     cleanup_modified = 0
 
     # Track final consensus per track
@@ -392,6 +402,16 @@ def process_video(
                     det_conf = det_confs[i]
                     break
 
+            # Check if bib is fully visible (not at frame edge)
+            is_visible, edge_reason = completeness_checker.is_fully_visible(
+                bbox=(x1, y1, x2, y2),
+                frame_width=width,
+                frame_height=height,
+            )
+            if not is_visible:
+                edge_rejected += 1
+                continue  # Skip bibs entering/exiting frame
+
             # Expand crop slightly for OCR
             pad_x = int((x2 - x1) * 0.05)
             pad_y = int((y2 - y1) * 0.05)
@@ -408,7 +428,10 @@ def process_video(
             if quality_filter:
                 quality = quality_filter.assess(crop)
                 if not quality.is_acceptable:
-                    quality_rejected += 1
+                    if "partial" in (quality.rejection_reason or "").lower():
+                        partial_rejected += 1
+                    else:
+                        quality_rejected += 1
                     continue  # Skip OCR for low-quality crops
 
             # OCR
@@ -579,7 +602,10 @@ def process_video(
 
     # Tier 2 stats
     print(f"\nTier 2 Optimizations:")
-    print(f"  Quality-rejected crops: {quality_rejected} (saved OCR calls)")
+    print(f"  Edge-rejected (partial at frame edge): {edge_rejected}")
+    print(f"  Partial/obstructed rejected: {partial_rejected}")
+    print(f"  Quality-rejected (blur/size/etc): {quality_rejected}")
+    print(f"  Total OCR calls saved: {edge_rejected + partial_rejected + quality_rejected}")
     print(f"  OCR cleanups applied: {cleanup_modified}")
 
     # Count by confidence level
