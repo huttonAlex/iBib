@@ -56,12 +56,14 @@ def test_on_dataset(dataset_dir: Path, output_dir: Optional[Path] = None):
             for row in reader:
                 labels[row['filename']] = row['label']
 
-    # Initialize filter
+    # Initialize filter with improved partial bib detection
     quality_filter = CropQualityFilter(
         min_blur_score=50.0,
         min_width=40,
         min_height=15,
-        min_completeness=0.6,
+        min_aspect_ratio=0.7,
+        min_completeness=0.45,
+        min_content_extent=0.5,
         check_completeness=True,
     )
 
@@ -179,12 +181,14 @@ def test_on_video(
     # Load detector
     detector = YOLO(detector_path)
 
-    # Initialize filters
+    # Initialize filters with improved partial bib detection
     quality_filter_on = CropQualityFilter(
         min_blur_score=50.0,
         min_width=40,
         min_height=15,
-        min_completeness=0.6,
+        min_aspect_ratio=0.7,
+        min_completeness=0.45,
+        min_content_extent=0.5,
         check_completeness=True,
     )
 
@@ -192,6 +196,7 @@ def test_on_video(
         min_blur_score=50.0,
         min_width=40,
         min_height=15,
+        min_aspect_ratio=0.7,
         check_completeness=False,
     )
 

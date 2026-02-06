@@ -770,10 +770,11 @@ class CropQualityFilter:
         min_blur_score: float = 50.0,
         min_width: int = 40,
         min_height: int = 15,
-        min_aspect_ratio: float = 1.0,
+        min_aspect_ratio: float = 0.7,  # Crops can be nearly square; reject very tall/narrow
         max_aspect_ratio: float = 6.0,
         min_contrast: float = 20.0,
-        min_completeness: float = 0.6,
+        min_completeness: float = 0.45,  # Combined score from multiple factors
+        min_content_extent: float = 0.5,  # Content should span at least 50% of width
         check_completeness: bool = True,
     ):
         if not CV2_AVAILABLE:
@@ -796,6 +797,7 @@ class CropQualityFilter:
         self.max_aspect_ratio = max_aspect_ratio
         self.min_contrast = min_contrast
         self.min_completeness = min_completeness
+        self.min_content_extent = min_content_extent
         self.check_completeness = check_completeness
 
     def assess(self, crop: Any) -> CropQuality:
@@ -891,8 +893,20 @@ class CropQualityFilter:
 
         # Completeness check (detect partial/obstructed bibs)
         completeness_score = 1.0
+        content_extent = 1.0
         if self.check_completeness:
-            completeness_score = self._assess_completeness(gray)
+            completeness_score, content_extent = self._assess_completeness(gray)
+
+            # Check content extent first (most reliable indicator)
+            if content_extent < self.min_content_extent:
+                return CropQuality(
+                    is_acceptable=False,
+                    blur_score=blur_score,
+                    aspect_ratio=aspect_ratio,
+                    pixel_count=pixel_count,
+                    completeness_score=completeness_score,
+                    rejection_reason=f"Partial bib - content spans only {content_extent:.0%} of width (need {self.min_content_extent:.0%})",
+                )
 
             if completeness_score < self.min_completeness:
                 return CropQuality(
@@ -901,7 +915,7 @@ class CropQualityFilter:
                     aspect_ratio=aspect_ratio,
                     pixel_count=pixel_count,
                     completeness_score=completeness_score,
-                    rejection_reason=f"Likely partial/obstructed: {completeness_score:.2f} < {self.min_completeness}",
+                    rejection_reason=f"Likely partial/obstructed: score {completeness_score:.2f} < {self.min_completeness}",
                 )
 
         return CropQuality(
@@ -925,112 +939,119 @@ class CropQualityFilter:
         """
         return self.assess(crop).is_acceptable
 
-    def _assess_completeness(self, gray: Any) -> float:
+    def _assess_completeness(self, gray: Any) -> Tuple[float, float]:
         """
         Assess whether a bib crop appears complete vs partial/obstructed.
 
-        Checks for signs of partial visibility:
-        1. Edge intensity - text at crop edges suggests truncation
-        2. Margin analysis - complete bibs have margins around text
-        3. Symmetry - partial bibs often have asymmetric content
+        This method uses multiple heuristics to detect partial bibs:
+        1. Content extent - digits should span most of the crop width
+        2. Content density - check for sufficient high-contrast regions
+        3. Symmetry - partial crops often have lopsided content
+        4. Edge analysis - content touching edges suggests truncation
 
         Args:
             gray: Grayscale image of crop
 
         Returns:
-            Completeness score from 0.0 (definitely partial) to 1.0 (complete)
+            (completeness_score, content_extent) tuple
+            - completeness_score: 0.0 (definitely partial) to 1.0 (complete)
+            - content_extent: fraction of width containing digit content
         """
         h, w = gray.shape[:2]
+
+        # Binarize to find digit regions (adaptive threshold handles varying backgrounds)
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10
+        )
+
+        # Find vertical projection (sum of white pixels in each column)
+        col_sums = np.sum(binary, axis=0) / 255.0  # Normalize by height
+
+        # Threshold to determine which columns have "content"
+        content_threshold = h * 0.15  # At least 15% of column height should have content
+        content_cols = col_sums > content_threshold
+
+        # Find the extent of content (first and last column with content)
+        content_indices = np.where(content_cols)[0]
+
+        if len(content_indices) < 3:
+            # Very little content found - likely garbage or very partial
+            return 0.2, 0.0
+
+        first_content = content_indices[0]
+        last_content = content_indices[-1]
+        content_span = last_content - first_content + 1
+        content_extent = content_span / w
+
+        # Check margins - complete bibs should have some margin on each side
+        left_margin = first_content / w
+        right_margin = (w - last_content - 1) / w
+
+        # Calculate completeness score based on multiple factors
         scores = []
 
-        # 1. Edge margin check - complete bibs should have some margin
-        # Check if there's high-contrast content at the very edges
-        edge_width = max(3, w // 20)
-        edge_height = max(2, h // 10)
+        # 1. Content extent score - content should span most of the width
+        # For a 4-digit bib, digits should span ~70-90% of a proper crop
+        extent_score = min(1.0, content_extent / self.min_content_extent)
+        scores.append(extent_score)
 
-        # Left edge
-        left_edge = gray[:, :edge_width]
-        left_intensity = float(np.std(left_edge))
+        # 2. Margin balance - both sides should have similar margins
+        # Lopsided margins suggest truncation on one side
+        if left_margin > 0.02 and right_margin > 0.02:
+            margin_ratio = min(left_margin, right_margin) / max(left_margin, right_margin)
+            margin_score = margin_ratio  # 1.0 = perfectly balanced
+        elif left_margin < 0.02 or right_margin < 0.02:
+            # Content touching edge - penalize heavily
+            margin_score = 0.3
+        else:
+            margin_score = 0.5
+        scores.append(margin_score)
 
-        # Right edge
-        right_edge = gray[:, -edge_width:]
-        right_intensity = float(np.std(right_edge))
+        # 3. Content density - how much of the content region is actually filled
+        if content_span > 0:
+            content_region_cols = content_cols[first_content:last_content + 1]
+            density = np.mean(content_region_cols)
+            # Digits have gaps between them, so expect 40-70% density
+            if density < 0.3:
+                density_score = density / 0.3  # Sparse content = likely partial
+            elif density > 0.85:
+                density_score = 0.8  # Too dense = might be obstruction
+            else:
+                density_score = 1.0
+            scores.append(density_score)
 
-        # Center region (for comparison)
-        center = gray[:, w//4:3*w//4]
-        center_intensity = float(np.std(center))
+        # 4. Content distribution - divide into sections and check each has content
+        n_sections = 4
+        section_width = w // n_sections
+        sections_with_content = 0
+        for i in range(n_sections):
+            section_start = i * section_width
+            section_end = min((i + 1) * section_width, w)
+            section_content = np.any(content_cols[section_start:section_end])
+            if section_content:
+                sections_with_content += 1
 
-        # If edges have similar intensity to center, likely truncated
-        if center_intensity > 10:  # Only check if there's content
-            left_ratio = left_intensity / center_intensity
-            right_ratio = right_intensity / center_intensity
+        distribution_score = sections_with_content / n_sections
+        scores.append(distribution_score)
 
-            # High ratio at edge = likely text at edge = truncated
-            edge_score = 1.0
-            if left_ratio > 0.8:
-                edge_score -= 0.3
-            if right_ratio > 0.8:
-                edge_score -= 0.3
-            scores.append(max(0.0, edge_score))
+        # 5. Vertical content check - digits should fill vertical space
+        row_sums = np.sum(binary, axis=1) / 255.0
+        row_content = row_sums > (w * 0.1)  # At least 10% of width
+        row_indices = np.where(row_content)[0]
+        if len(row_indices) > 0:
+            vertical_extent = (row_indices[-1] - row_indices[0] + 1) / h
+            vertical_score = min(1.0, vertical_extent / 0.5)  # Expect at least 50% height
+            scores.append(vertical_score)
 
-        # 2. Vertical edge check (for occlusion from top/bottom)
-        top_edge = gray[:edge_height, :]
-        bottom_edge = gray[-edge_height:, :]
+        # Combine scores with weights
+        # Content extent is most important for catching partial bibs
+        weights = [0.35, 0.2, 0.15, 0.2, 0.1]
+        if len(scores) < len(weights):
+            weights = weights[:len(scores)]
 
-        top_intensity = float(np.std(top_edge))
-        bottom_intensity = float(np.std(bottom_edge))
+        weighted_score = sum(s * w for s, w in zip(scores, weights)) / sum(weights)
 
-        if center_intensity > 10:
-            top_ratio = top_intensity / center_intensity
-            bottom_ratio = bottom_intensity / center_intensity
-
-            vert_score = 1.0
-            if top_ratio > 0.9:
-                vert_score -= 0.2
-            if bottom_ratio > 0.9:
-                vert_score -= 0.2
-            scores.append(max(0.0, vert_score))
-
-        # 3. Content distribution check
-        # Divide into thirds and check for content in each
-        third_w = w // 3
-        left_third = gray[:, :third_w]
-        center_third = gray[:, third_w:2*third_w]
-        right_third = gray[:, 2*third_w:]
-
-        left_content = float(np.std(left_third))
-        center_content = float(np.std(center_third))
-        right_content = float(np.std(right_third))
-
-        max_content = max(left_content, center_content, right_content)
-        if max_content > 10:
-            # All thirds should have some content for complete bib
-            min_content = min(left_content, center_content, right_content)
-            distribution_score = min_content / max_content
-            scores.append(distribution_score)
-
-        # 4. Gradient check at edges (sharp cutoff suggests truncation)
-        # Use Sobel to detect vertical edges
-        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-
-        left_gradient = float(np.abs(sobel_x[:, :edge_width]).mean())
-        right_gradient = float(np.abs(sobel_x[:, -edge_width:]).mean())
-        inner_gradient = float(np.abs(sobel_x[:, edge_width:-edge_width]).mean())
-
-        if inner_gradient > 5:
-            # High gradient at edges compared to inner suggests occlusion edge
-            gradient_score = 1.0
-            if left_gradient > inner_gradient * 1.5:
-                gradient_score -= 0.25
-            if right_gradient > inner_gradient * 1.5:
-                gradient_score -= 0.25
-            scores.append(max(0.0, gradient_score))
-
-        # Combine scores
-        if not scores:
-            return 1.0
-
-        return float(np.mean(scores))
+        return float(weighted_score), float(content_extent)
 
 
 class BibCompletenessChecker:
@@ -1432,6 +1453,131 @@ class DigitCountValidator:
         """Create validator from bib set by inferring expected digit counts."""
         counts = {len(b) for b in bib_set if b}
         return cls(expected_counts=counts, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Suspicious Prediction Filter (catches partial bib OCR errors)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SuspiciousPredictionResult:
+    """Result of suspicious prediction check."""
+
+    is_suspicious: bool
+    reason: Optional[str] = None
+    adjusted_confidence: float = 0.0
+    should_reject: bool = False
+
+
+class SuspiciousPredictionFilter:
+    """
+    Post-OCR filter to catch suspicious predictions that indicate partial bibs.
+
+    This filter catches cases where:
+    1. Very short predictions (1-2 digits) with medium confidence
+       - Likely a partial bib where only some digits are visible
+    2. Low confidence predictions regardless of length
+       - OCR is uncertain, possibly due to obstruction
+    3. Unexpected digit counts combined with low confidence
+       - e.g., expecting 4-digit bibs but got 1 digit with 0.28 confidence
+
+    Use this AFTER OCR to catch partial bib errors that image analysis missed.
+    """
+
+    def __init__(
+        self,
+        min_confidence_short: float = 0.85,  # Require higher conf for 1-2 digit predictions
+        min_confidence_medium: float = 0.7,  # Normal threshold for 3+ digits
+        reject_confidence: float = 0.35,  # Below this, reject regardless
+        expected_digit_counts: Optional[Set[int]] = None,  # e.g., {3, 4} for typical races
+        strict_mode: bool = False,  # If True, reject suspicious; if False, just flag
+    ):
+        """
+        Args:
+            min_confidence_short: Min confidence for 1-2 digit predictions
+            min_confidence_medium: Min confidence for 3+ digit predictions
+            reject_confidence: Reject predictions below this confidence
+            expected_digit_counts: Expected digit counts for this race
+            strict_mode: If True, mark suspicious as should_reject
+        """
+        self.min_confidence_short = min_confidence_short
+        self.min_confidence_medium = min_confidence_medium
+        self.reject_confidence = reject_confidence
+        self.expected_digit_counts = expected_digit_counts or {1, 2, 3, 4, 5}
+        self.strict_mode = strict_mode
+
+    def check(self, prediction: str, confidence: float) -> SuspiciousPredictionResult:
+        """
+        Check if a prediction is suspicious.
+
+        Args:
+            prediction: OCR predicted text (digits)
+            confidence: OCR confidence score
+
+        Returns:
+            SuspiciousPredictionResult with assessment
+        """
+        if not prediction:
+            return SuspiciousPredictionResult(
+                is_suspicious=True,
+                reason="Empty prediction",
+                adjusted_confidence=0.0,
+                should_reject=True,
+            )
+
+        digit_count = len(prediction)
+
+        # Rule 1: Very low confidence - reject
+        if confidence < self.reject_confidence:
+            return SuspiciousPredictionResult(
+                is_suspicious=True,
+                reason=f"Very low confidence ({confidence:.2f} < {self.reject_confidence})",
+                adjusted_confidence=confidence,
+                should_reject=True,
+            )
+
+        # Rule 2: Short predictions need higher confidence
+        if digit_count <= 2 and confidence < self.min_confidence_short:
+            return SuspiciousPredictionResult(
+                is_suspicious=True,
+                reason=f"Short prediction ({digit_count} digits) with low confidence ({confidence:.2f})",
+                adjusted_confidence=confidence * 0.7,  # Penalize
+                should_reject=self.strict_mode,
+            )
+
+        # Rule 3: Unexpected digit count - always suspicious, reject if confidence not very high
+        if digit_count not in self.expected_digit_counts:
+            if confidence < 0.95:  # Need very high confidence for unexpected digit count
+                return SuspiciousPredictionResult(
+                    is_suspicious=True,
+                    reason=f"Unexpected digit count ({digit_count}) - need >0.95 confidence, got {confidence:.2f}",
+                    adjusted_confidence=confidence * 0.8,
+                    should_reject=self.strict_mode or confidence < self.min_confidence_medium,
+                )
+
+        # Rule 4: Medium-length predictions with low confidence
+        if confidence < self.min_confidence_medium:
+            return SuspiciousPredictionResult(
+                is_suspicious=True,
+                reason=f"Low confidence ({confidence:.2f})",
+                adjusted_confidence=confidence,
+                should_reject=False,  # Flag but don't reject
+            )
+
+        # Passed all checks
+        return SuspiciousPredictionResult(
+            is_suspicious=False,
+            reason=None,
+            adjusted_confidence=confidence,
+            should_reject=False,
+        )
+
+    def filter_batch(
+        self, predictions: List[Tuple[str, float]]
+    ) -> List[SuspiciousPredictionResult]:
+        """Check multiple predictions."""
+        return [self.check(pred, conf) for pred, conf in predictions]
 
 
 # ---------------------------------------------------------------------------
