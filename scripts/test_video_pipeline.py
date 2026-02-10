@@ -115,11 +115,12 @@ class CRNNOCR:
         tensor = tensor[np.newaxis, np.newaxis, :, :]  # (1, 1, 32, 128)
 
         output = self.session.run(None, {self.input_name: tensor})[0]
-        log_probs = output[0]  # (T, num_classes)
+        logits = output[0]  # (T, num_classes)
 
-        # Greedy CTC decode
-        indices = log_probs.argmax(axis=-1)
-        probs = np.exp(log_probs)
+        # Greedy CTC decode — apply softmax to get 0-1 probabilities
+        indices = logits.argmax(axis=-1)
+        exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
         max_probs = probs.max(axis=-1)
 
         result = []
