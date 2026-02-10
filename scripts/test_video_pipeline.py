@@ -27,7 +27,6 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torchvision import transforms
 from ultralytics import YOLO
 
 # Add src to path for local imports
@@ -64,15 +63,14 @@ class PARSeqOCR:
             self.model.load_state_dict(state)
         self.model.eval()
 
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize(
-                    (32, 128), interpolation=transforms.InterpolationMode.BICUBIC
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(0.5, 0.5),
-            ]
-        )
+        self.transform = self._make_transform
+
+    @staticmethod
+    def _make_transform(img: Image.Image) -> torch.Tensor:
+        """Resize, convert to tensor, and normalize without torchvision."""
+        img = img.resize((128, 32), Image.BICUBIC)
+        t = torch.from_numpy(np.array(img, dtype=np.float32)).permute(2, 0, 1) / 255.0
+        return (t - 0.5) / 0.5
 
     def predict(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
         """Predict bib number from BGR crop."""
