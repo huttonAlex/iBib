@@ -256,6 +256,7 @@ def process_video(
     conf_threshold: float = 0.5,
     ocr_conf_threshold: float = 0.5,
     enable_quality_filter: bool = True,
+    write_video: bool = True,
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -325,12 +326,14 @@ def process_video(
     if bib_validator:
         print(f"Bib set: {len(bib_validator.bib_set)} valid numbers loaded")
 
-    # Output video
+    # Output video (optional — writing raw video is I/O-bound and slow)
     output_video_path = output_dir / f"{Path(video_path).stem}_annotated.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out_writer = cv2.VideoWriter(
-        str(output_video_path), fourcc, fps, (width, height)
-    )
+    out_writer = None
+    if write_video:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out_writer = cv2.VideoWriter(
+            str(output_video_path), fourcc, fps, (width, height)
+        )
 
     # Detection log with enhanced columns
     log_path = output_dir / f"{Path(video_path).stem}_detections.csv"
@@ -578,7 +581,8 @@ def process_video(
             )
 
         # Write frame
-        out_writer.write(frame)
+        if out_writer:
+            out_writer.write(frame)
 
         # Show
         if show:
@@ -593,7 +597,8 @@ def process_video(
             )
 
     cap.release()
-    out_writer.release()
+    if out_writer:
+        out_writer.release()
     log_file.close()
 
     if show:
@@ -645,7 +650,8 @@ def process_video(
     print(f"\nItems flagged for review: {review_count}")
 
     print(f"\nOutputs:")
-    print(f"  Video:  {output_video_path}")
+    if write_video:
+        print(f"  Video:  {output_video_path}")
     print(f"  Log:    {log_path}")
     print(f"  Review: {review_path}")
 
@@ -707,6 +713,11 @@ def main():
         "--no-quality-filter",
         action="store_true",
         help="Disable crop quality filtering (not recommended)",
+    )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Skip writing annotated output video (much faster)",
     )
     args = parser.parse_args()
 
@@ -780,6 +791,7 @@ def main():
         conf_threshold=args.conf,
         ocr_conf_threshold=args.ocr_conf,
         enable_quality_filter=not args.no_quality_filter,
+        write_video=not args.no_video,
     )
 
     print("\nDone!")
