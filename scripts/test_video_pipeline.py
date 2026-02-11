@@ -102,7 +102,8 @@ class CRNNOCR:
     def __init__(self, onnx_path: str):
         import onnxruntime as ort
 
-        self.session = ort.InferenceSession(onnx_path)
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.session = ort.InferenceSession(onnx_path, providers=providers)
         self.input_name = self.session.get_inputs()[0].name
 
     def predict(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
@@ -259,7 +260,9 @@ def process_video(
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
     # Load detector
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     detector = YOLO(detector_path)
+    detector.to(device)
 
     # Initialize Tier 1 components
     tracker = CentroidTracker(max_disappeared=30, max_distance=100)
