@@ -174,7 +174,24 @@ class BibSetValidator:
         """
         candidates = []
 
-        # First, check bibs with same prefix (faster)
+        # Priority 1: Leading-digit recovery — the most common OCR error
+        # is truncating the first digit (camera angle clips left side of bib).
+        # Try prepending each digit 1-9 and check for exact match.
+        for d in "123456789":
+            prepended = d + prediction
+            if prepended in self.bib_set:
+                # High similarity: all original digits are correct, just missing one
+                sim = len(prediction) / (len(prediction) + 1)  # e.g. 3/4 = 0.75
+                candidates.append((prepended, sim + 0.15))  # Boost for exact structural match
+
+        # Priority 2: Trailing-digit recovery (less common but possible)
+        for d in "0123456789":
+            appended = prediction + d
+            if appended in self.bib_set:
+                sim = len(prediction) / (len(prediction) + 1)
+                candidates.append((appended, sim + 0.10))
+
+        # Priority 3: Check bibs with same prefix (faster)
         if len(prediction) >= 2:
             prefix = prediction[:2]
             prefix_bibs = self._prefix_index.get(prefix, [])
@@ -183,7 +200,7 @@ class BibSetValidator:
                 if sim >= self.fuzzy_threshold:
                     candidates.append((bib, sim))
 
-        # If no prefix matches, check all bibs with similar length
+        # Priority 4: If no good matches yet, check all bibs with similar length
         if not candidates:
             for bib in self.bib_set:
                 # Only compare similar lengths
@@ -191,6 +208,13 @@ class BibSetValidator:
                     sim = self._similarity(prediction, bib)
                     if sim >= self.fuzzy_threshold:
                         candidates.append((bib, sim))
+
+        # Deduplicate (keep highest similarity per bib)
+        best = {}
+        for bib, sim in candidates:
+            if bib not in best or sim > best[bib]:
+                best[bib] = sim
+        candidates = list(best.items())
 
         # Sort by similarity (highest first)
         candidates.sort(key=lambda x: -x[1])
@@ -1206,6 +1230,7 @@ class PostOCRCleanup:
         max_digits: int = 5,
         strip_leading_zeros: bool = True,
         fix_letter_confusion: bool = True,
+        max_bib_value: Optional[int] = None,
     ):
         """
         Args:
@@ -1213,11 +1238,13 @@ class PostOCRCleanup:
             max_digits: Maximum valid digit count
             strip_leading_zeros: Remove leading zeros (0123 -> 123)
             fix_letter_confusion: Fix common letter-to-digit errors
+            max_bib_value: Reject numbers above this value (e.g. 1700 for a race with bibs 1-1678)
         """
         self.min_digits = min_digits
         self.max_digits = max_digits
         self.strip_leading_zeros = strip_leading_zeros
         self.fix_letter_confusion = fix_letter_confusion
+        self.max_bib_value = max_bib_value
 
     def clean(self, text: str) -> Tuple[str, bool]:
         """
@@ -1258,6 +1285,10 @@ class PostOCRCleanup:
             elif len(digits) < self.min_digits:
                 # Too few digits - might be garbage
                 pass
+
+        # Range check: reject numbers above known max bib value
+        if self.max_bib_value and digits.isdigit() and int(digits) > self.max_bib_value:
+            return "", True
 
         was_modified = digits != original
         return digits, was_modified

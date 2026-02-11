@@ -290,11 +290,19 @@ def process_video(
         edge_margin_ratio=0.02,  # 2% margin from frame edges
     )
 
+    # Infer max bib value from bib set for range filtering
+    max_bib_value = None
+    if bib_validator:
+        numeric_bibs = [int(b) for b in bib_validator.bib_set if b.isdigit()]
+        if numeric_bibs:
+            max_bib_value = max(numeric_bibs)
+
     post_cleanup = PostOCRCleanup(
         min_digits=1,
         max_digits=5,
         strip_leading_zeros=True,
         fix_letter_confusion=True,
+        max_bib_value=max_bib_value,
     )
 
     # Infer expected digit counts from bib set if available
@@ -414,13 +422,18 @@ def process_video(
                 edge_rejected += 1
                 continue  # Skip bibs entering/exiting frame
 
-            # Expand crop slightly for OCR
-            pad_x = int((x2 - x1) * 0.05)
-            pad_y = int((y2 - y1) * 0.05)
-            x1_pad = max(0, x1 - pad_x)
-            y1_pad = max(0, y1 - pad_y)
-            x2_pad = min(width, x2 + pad_x)
-            y2_pad = min(height, y2 + pad_y)
+            # Expand crop for OCR — asymmetric padding because camera is
+            # typically offset, causing leading (left) digits to be clipped
+            bib_w = x2 - x1
+            bib_h = y2 - y1
+            pad_left = int(bib_w * 0.25)
+            pad_right = int(bib_w * 0.10)
+            pad_top = int(bib_h * 0.10)
+            pad_bottom = int(bib_h * 0.10)
+            x1_pad = max(0, x1 - pad_left)
+            y1_pad = max(0, y1 - pad_top)
+            x2_pad = min(width, x2 + pad_right)
+            y2_pad = min(height, y2 + pad_bottom)
 
             crop = frame[y1_pad:y2_pad, x1_pad:x2_pad]
             if crop.size == 0:
