@@ -53,6 +53,14 @@ camera:
 
   # Flip image: none, horizontal, vertical, both
   flip: "none"
+
+  # Camera placement relative to finish line (facing runners)
+  # Affects bib crop padding to compensate for viewing angle.
+  # - "left":   Camera is to the LEFT of the finish (runners' right side is closer)
+  # - "right":  Camera is to the RIGHT of the finish (runners' left side is closer)
+  # - "center": Camera is centered on the course
+  # See docs/CAMERA_PLACEMENT.md for detailed guidance.
+  placement: "center"
 ```
 
 | Setting | Type | Default | Range | Description |
@@ -61,6 +69,7 @@ camera:
 | `camera.framerate` | int | 60 | 30-120 | Target FPS |
 | `camera.exposure_mode` | string | "auto" | auto, manual | Exposure control |
 | `camera.flip` | string | "none" | none, horizontal, vertical, both | Image orientation |
+| `camera.placement` | string | "center" | left, right, center | Camera position relative to course |
 
 ---
 
@@ -334,6 +343,7 @@ camera:
   framerate: 60
   exposure_mode: "auto"
   flip: "none"
+  placement: "center"
 
 detection:
   confidence_threshold: 0.7

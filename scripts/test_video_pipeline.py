@@ -12,6 +12,7 @@ Usage:
     python scripts/test_video_pipeline.py path/to/video.mp4
     python scripts/test_video_pipeline.py path/to/video.mp4 --ocr crnn
     python scripts/test_video_pipeline.py path/to/video.mp4 --bib-set bibs.txt
+    python scripts/test_video_pipeline.py path/to/video.mp4 --placement right --no-video
     python scripts/test_video_pipeline.py path/to/video.mp4 --show
 """
 
@@ -246,6 +247,14 @@ class CentroidTracker:
 # ---------------------------------------------------------------------------
 
 
+# Crop padding presets per camera placement (left_pct, right_pct, top_pct, bottom_pct)
+PLACEMENT_PADDING = {
+    "center": (0.15, 0.15, 0.10, 0.10),
+    "left":   (0.10, 0.25, 0.10, 0.10),
+    "right":  (0.25, 0.10, 0.10, 0.10),
+}
+
+
 def process_video(
     video_path: str,
     detector_path: str,
@@ -257,6 +266,7 @@ def process_video(
     ocr_conf_threshold: float = 0.5,
     enable_quality_filter: bool = True,
     write_video: bool = True,
+    placement: str = "center",
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -425,14 +435,15 @@ def process_video(
                 edge_rejected += 1
                 continue  # Skip bibs entering/exiting frame
 
-            # Expand crop for OCR — asymmetric padding because camera is
-            # typically offset, causing leading (left) digits to be clipped
+            # Expand crop for OCR — padding varies by camera placement to
+            # compensate for the far side of the bib being clipped by the angle
             bib_w = x2 - x1
             bib_h = y2 - y1
-            pad_left = int(bib_w * 0.25)
-            pad_right = int(bib_w * 0.10)
-            pad_top = int(bib_h * 0.10)
-            pad_bottom = int(bib_h * 0.10)
+            lp, rp, tp, bp = PLACEMENT_PADDING.get(placement, PLACEMENT_PADDING["center"])
+            pad_left = int(bib_w * lp)
+            pad_right = int(bib_w * rp)
+            pad_top = int(bib_h * tp)
+            pad_bottom = int(bib_h * bp)
             x1_pad = max(0, x1 - pad_left)
             y1_pad = max(0, y1 - pad_top)
             x2_pad = min(width, x2 + pad_right)
@@ -719,6 +730,14 @@ def main():
         action="store_true",
         help="Skip writing annotated output video (much faster)",
     )
+    parser.add_argument(
+        "--placement",
+        type=str,
+        default="center",
+        choices=["left", "right", "center"],
+        help="Camera placement relative to finish line (affects crop padding). "
+             "See docs/CAMERA_PLACEMENT.md for guidance. (default: center)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -743,6 +762,7 @@ def main():
     print(f"Video:    {video_path}")
     print(f"Detector: {detector_path}")
     print(f"OCR:      {args.ocr}")
+    print(f"Placement: {args.placement}")
     print(f"Output:   {output_dir}")
 
     # Load bib validator if specified
@@ -792,6 +812,7 @@ def main():
         ocr_conf_threshold=args.ocr_conf,
         enable_quality_filter=not args.no_quality_filter,
         write_video=not args.no_video,
+        placement=args.placement,
     )
 
     print("\nDone!")
