@@ -5,14 +5,17 @@ Runs YOLOv8 bib detector + PARSeq/CRNN OCR on each frame with:
 - Bib set validation (reject impossible numbers)
 - Multi-frame voting (temporal consistency)
 - Confidence thresholding (flag uncertain reads)
+- Person detection via background subtraction (optional)
+- Timing-line crossing detection
 
-Outputs annotated video, detection log, and review queue.
+Outputs annotated video, detection log, crossing log, and review queue.
 
 Usage:
     python scripts/test_video_pipeline.py path/to/video.mp4
     python scripts/test_video_pipeline.py path/to/video.mp4 --ocr crnn
     python scripts/test_video_pipeline.py path/to/video.mp4 --bib-set bibs.txt
     python scripts/test_video_pipeline.py path/to/video.mp4 --placement right --no-video
+    python scripts/test_video_pipeline.py path/to/video.mp4 --timing-line 0.5,0.0,0.5,1.0
     python scripts/test_video_pipeline.py path/to/video.mp4 --show
 """
 
@@ -20,7 +23,6 @@ import argparse
 import csv
 import sys
 import time
-from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,6 +44,16 @@ from pointcam.recognition import (
     PostOCRCleanup,
     DigitCountValidator,
     BibCompletenessChecker,
+)
+from pointcam.crossing import (
+    CentroidTracker,
+    TimingLine,
+    CrossingDetector,
+    BackgroundSubtractorManager,
+    PersonBibAssociator,
+    MergedBlobEstimator,
+    CrossingEvent,
+    CrossingEventLog,
 )
 
 
@@ -138,111 +150,6 @@ class CRNNOCR:
 
 
 # ---------------------------------------------------------------------------
-# Simple Centroid Tracker
-# ---------------------------------------------------------------------------
-
-
-class CentroidTracker:
-    """Simple centroid-based tracker for maintaining track IDs across frames."""
-
-    def __init__(self, max_disappeared: int = 30, max_distance: float = 100.0):
-        self.next_id = 0
-        self.objects: Dict[int, Tuple[float, float]] = OrderedDict()
-        self.bboxes: Dict[int, Tuple[int, int, int, int]] = OrderedDict()
-        self.disappeared: Dict[int, int] = OrderedDict()
-        self.max_disappeared = max_disappeared
-        self.max_distance = max_distance
-
-    def register(self, centroid: Tuple[float, float], bbox: Tuple[int, int, int, int]):
-        """Register a new object."""
-        self.objects[self.next_id] = centroid
-        self.bboxes[self.next_id] = bbox
-        self.disappeared[self.next_id] = 0
-        self.next_id += 1
-
-    def deregister(self, object_id: int):
-        """Deregister an object."""
-        del self.objects[object_id]
-        del self.bboxes[object_id]
-        del self.disappeared[object_id]
-
-    def update(
-        self, detections: List[Tuple[int, int, int, int]]
-    ) -> Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]]:
-        """
-        Update tracker with new detections.
-
-        Args:
-            detections: List of (x1, y1, x2, y2) bounding boxes
-
-        Returns:
-            Dict of {track_id: (centroid, bbox)}
-        """
-        if len(detections) == 0:
-            for object_id in list(self.disappeared.keys()):
-                self.disappeared[object_id] += 1
-                if self.disappeared[object_id] > self.max_disappeared:
-                    self.deregister(object_id)
-            return {
-                oid: (self.objects[oid], self.bboxes[oid]) for oid in self.objects
-            }
-
-        # Calculate centroids
-        input_centroids = []
-        for x1, y1, x2, y2 in detections:
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            input_centroids.append((cx, cy))
-
-        if len(self.objects) == 0:
-            for i, centroid in enumerate(input_centroids):
-                self.register(centroid, detections[i])
-        else:
-            object_ids = list(self.objects.keys())
-            object_centroids = list(self.objects.values())
-
-            # Compute distance matrix
-            D = np.zeros((len(object_centroids), len(input_centroids)))
-            for i, oc in enumerate(object_centroids):
-                for j, ic in enumerate(input_centroids):
-                    D[i, j] = np.sqrt((oc[0] - ic[0]) ** 2 + (oc[1] - ic[1]) ** 2)
-
-            # Match using greedy approach
-            rows = D.min(axis=1).argsort()
-            cols = D.argmin(axis=1)[rows]
-
-            used_rows = set()
-            used_cols = set()
-
-            for row, col in zip(rows, cols):
-                if row in used_rows or col in used_cols:
-                    continue
-                if D[row, col] > self.max_distance:
-                    continue
-
-                object_id = object_ids[row]
-                self.objects[object_id] = input_centroids[col]
-                self.bboxes[object_id] = detections[col]
-                self.disappeared[object_id] = 0
-
-                used_rows.add(row)
-                used_cols.add(col)
-
-            # Handle unmatched existing objects
-            for row in set(range(len(object_centroids))) - used_rows:
-                object_id = object_ids[row]
-                self.disappeared[object_id] += 1
-                if self.disappeared[object_id] > self.max_disappeared:
-                    self.deregister(object_id)
-
-            # Register new detections
-            for col in set(range(len(input_centroids))) - used_cols:
-                self.register(input_centroids[col], detections[col])
-
-        return {oid: (self.objects[oid], self.bboxes[oid]) for oid in self.objects}
-
-
-# ---------------------------------------------------------------------------
 # Enhanced Pipeline
 # ---------------------------------------------------------------------------
 
@@ -267,6 +174,10 @@ def process_video(
     enable_quality_filter: bool = True,
     write_video: bool = True,
     placement: str = "center",
+    timing_line_coords: Optional[Tuple[float, float, float, float]] = None,
+    crossing_direction: str = "any",
+    debounce_time: float = 2.0,
+    enable_person_detect: bool = True,
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -383,6 +294,41 @@ def process_video(
     # Track final consensus per track
     final_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
 
+    # --- Person detection + crossing detection (optional) ---
+    timing_line = None
+    crossing_detector = None
+    bg_manager = None
+    person_tracker = None
+    person_bib_assoc = None
+    blob_estimator = None
+    crossing_log = None
+    crossing_seq = 0
+    total_crossings = 0
+    unknown_crossings = 0
+
+    if timing_line_coords is not None:
+        timing_line = TimingLine(*timing_line_coords)
+        debounce_frames = int(debounce_time * fps)
+        crossing_detector = CrossingDetector(
+            timing_line=timing_line,
+            direction=crossing_direction,
+            debounce_frames=debounce_frames,
+        )
+        print(f"Timing line: {timing_line_coords}, direction={crossing_direction}")
+        print(f"Debounce: {debounce_time}s ({debounce_frames} frames)")
+
+        if enable_person_detect:
+            bg_manager = BackgroundSubtractorManager()
+            person_tracker = CentroidTracker(max_disappeared=15, max_distance=150)
+            person_bib_assoc = PersonBibAssociator(max_distance=150)
+            blob_estimator = MergedBlobEstimator()
+            print("Person detection: ENABLED (MOG2 background subtraction)")
+        else:
+            print("Person detection: DISABLED")
+
+        crossing_log_path = output_dir / f"{Path(video_path).stem}_crossings.csv"
+        crossing_log = CrossingEventLog(crossing_log_path)
+
     print("\nProcessing...")
 
     while True:
@@ -395,7 +341,7 @@ def process_video(
 
         # Detect bibs
         t0 = time.perf_counter()
-        results = detector(frame, conf=conf_threshold, verbose=False)
+        results = detector(frame, conf=conf_threshold, device=device, verbose=False)
         t1 = time.perf_counter()
         total_det_time += t1 - t0
 
@@ -591,6 +537,87 @@ def process_video(
                 2,
             )
 
+        # --- Person detection + crossing detection ---
+        if bg_manager is not None:
+            person_bboxes = bg_manager.process(frame)
+            person_tracked = person_tracker.update(person_bboxes)
+
+            # Associate persons with bibs
+            associations = person_bib_assoc.associate(person_tracked, tracked)
+
+            # Check each person for crossing
+            for pid, (p_centroid, p_bbox) in person_tracked.items():
+                cx_norm = p_centroid[0] / width
+                cy_norm = p_centroid[1] / height
+
+                if crossing_detector.check(pid, cx_norm, cy_norm, frame_idx):
+                    bib_track_id = associations.get(pid)
+                    bib_number = "UNKNOWN"
+                    confidence = 0.0
+
+                    if bib_track_id is not None and bib_track_id in final_consensus:
+                        bib_number, confidence, _ = final_consensus[bib_track_id]
+
+                    est_count = blob_estimator.estimate(p_bbox)
+
+                    crossing_seq += 1
+                    event = CrossingEvent(
+                        sequence=crossing_seq,
+                        frame_idx=frame_idx,
+                        timestamp_sec=time_sec,
+                        person_track_id=pid,
+                        bib_number=bib_number,
+                        confidence=confidence,
+                        estimated_count=est_count,
+                        person_bbox=p_bbox,
+                    )
+                    crossing_log.write(event)
+                    total_crossings += 1
+                    if bib_number == "UNKNOWN":
+                        unknown_crossings += 1
+
+            # Cleanup stale crossing detector state
+            crossing_detector.cleanup(set(person_tracked.keys()))
+
+            # Draw person blobs (cyan)
+            for pid, (p_centroid, p_bbox) in person_tracked.items():
+                px1, py1, px2, py2 = p_bbox
+                cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 255, 0), 1)
+
+        elif crossing_detector is not None:
+            # No person detection — use bib tracker for crossings instead
+            for track_id, (centroid, bbox) in tracked.items():
+                cx_norm = centroid[0] / width
+                cy_norm = centroid[1] / height
+
+                if crossing_detector.check(track_id, cx_norm, cy_norm, frame_idx):
+                    bib_number = "UNKNOWN"
+                    confidence = 0.0
+                    if track_id in final_consensus:
+                        bib_number, confidence, _ = final_consensus[track_id]
+
+                    crossing_seq += 1
+                    event = CrossingEvent(
+                        sequence=crossing_seq,
+                        frame_idx=frame_idx,
+                        timestamp_sec=time_sec,
+                        person_track_id=track_id,
+                        bib_number=bib_number,
+                        confidence=confidence,
+                        person_bbox=bbox,
+                    )
+                    crossing_log.write(event)
+                    total_crossings += 1
+                    if bib_number == "UNKNOWN":
+                        unknown_crossings += 1
+
+            crossing_detector.cleanup(set(tracked.keys()))
+
+        # Draw timing line (magenta)
+        if timing_line is not None:
+            pt1, pt2 = timing_line.to_pixel_coords(width, height)
+            cv2.line(frame, pt1, pt2, (255, 0, 255), 2)
+
         # Write frame
         if out_writer:
             out_writer.write(frame)
@@ -611,6 +638,8 @@ def process_video(
     if out_writer:
         out_writer.release()
     log_file.close()
+    if crossing_log is not None:
+        crossing_log.close()
 
     if show:
         cv2.destroyAllWindows()
@@ -660,11 +689,21 @@ def process_video(
     review_count = len(confidence_mgr.get_pending_reviews())
     print(f"\nItems flagged for review: {review_count}")
 
+    if timing_line is not None:
+        print(f"\nCrossing Detection:")
+        print(f"  Total crossings: {total_crossings}")
+        print(f"  With bib: {total_crossings - unknown_crossings}")
+        print(f"  UNKNOWN (no bib): {unknown_crossings}")
+        if person_tracker is not None:
+            print(f"  Person tracks: {person_tracker.next_id}")
+
     print(f"\nOutputs:")
     if write_video:
         print(f"  Video:  {output_video_path}")
     print(f"  Log:    {log_path}")
     print(f"  Review: {review_path}")
+    if crossing_log is not None:
+        print(f"  Crossings: {crossing_log_path}")
 
 
 def main():
@@ -738,6 +777,31 @@ def main():
         help="Camera placement relative to finish line (affects crop padding). "
              "See docs/CAMERA_PLACEMENT.md for guidance. (default: center)",
     )
+    parser.add_argument(
+        "--timing-line",
+        type=str,
+        default=None,
+        help="Timing line as normalized coords: x1,y1,x2,y2 (e.g., '0.5,0.0,0.5,1.0'). "
+             "Enables crossing detection.",
+    )
+    parser.add_argument(
+        "--crossing-direction",
+        type=str,
+        default="any",
+        choices=["left_to_right", "right_to_left", "any"],
+        help="Valid crossing direction (default: any)",
+    )
+    parser.add_argument(
+        "--debounce-time",
+        type=float,
+        default=2.0,
+        help="Minimum seconds between crossings for the same track (default: 2.0)",
+    )
+    parser.add_argument(
+        "--no-person-detect",
+        action="store_true",
+        help="Disable person detection (use bib tracker for crossings instead)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -800,6 +864,19 @@ def main():
         ocr_model = CRNNOCR(str(crnn_onnx))
         print(f"  CRNN loaded from {crnn_onnx}")
 
+    # Parse timing line
+    timing_line_coords = None
+    if args.timing_line:
+        try:
+            parts = [float(x) for x in args.timing_line.split(",")]
+            if len(parts) != 4:
+                raise ValueError("need 4 values")
+            timing_line_coords = tuple(parts)
+        except ValueError:
+            print(f"ERROR: Invalid timing line format: {args.timing_line}")
+            print("  Expected format: x1,y1,x2,y2 (e.g., '0.5,0.0,0.5,1.0')")
+            sys.exit(1)
+
     # Process
     process_video(
         video_path=video_path,
@@ -813,6 +890,10 @@ def main():
         enable_quality_filter=not args.no_quality_filter,
         write_video=not args.no_video,
         placement=args.placement,
+        timing_line_coords=timing_line_coords,
+        crossing_direction=args.crossing_direction,
+        debounce_time=args.debounce_time,
+        enable_person_detect=not args.no_person_detect,
     )
 
     print("\nDone!")

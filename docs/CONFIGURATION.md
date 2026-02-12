@@ -108,6 +108,65 @@ detection:
 
 ---
 
+### Person Detection Settings
+
+Person detection uses OpenCV background subtraction (MOG2) to detect people crossing the timing line, even when their bib number is unreadable or missing. This is CPU-only (~3-5ms overhead per frame).
+
+```yaml
+person_detection:
+  # Enable person detection via background subtraction
+  enabled: true
+
+  # MOG2 background model history (frames)
+  bg_history: 500
+
+  # MOG2 variance threshold (higher = less sensitive)
+  bg_var_threshold: 50.0
+
+  # Minimum contour area (pixels) to be considered a person
+  min_area: 2000
+
+  # Maximum contour area (pixels)
+  max_area: 200000
+
+  # Aspect ratio range (height/width) for person-shaped blobs
+  min_aspect_ratio: 0.5
+  max_aspect_ratio: 5.0
+
+  # Morphological kernel size for noise cleanup
+  morph_kernel_size: 5
+
+  # Max pixel distance for associating a bib detection with a person blob
+  association_distance: 150
+
+  # Typical single-person area for merged blob estimation (pixels)
+  typical_person_area: 10000
+```
+
+| Setting | Type | Default | Range | Description |
+|---------|------|---------|-------|-------------|
+| `person_detection.enabled` | bool | true | true/false | Enable person detection |
+| `person_detection.bg_history` | int | 500 | 100-2000 | MOG2 background history frames |
+| `person_detection.bg_var_threshold` | float | 50.0 | 10-200 | MOG2 variance threshold |
+| `person_detection.min_area` | int | 2000 | 500-50000 | Min blob area for person |
+| `person_detection.max_area` | int | 200000 | 10000-1000000 | Max blob area |
+| `person_detection.min_aspect_ratio` | float | 0.5 | 0.1-2.0 | Min height/width ratio |
+| `person_detection.max_aspect_ratio` | float | 5.0 | 2.0-10.0 | Max height/width ratio |
+| `person_detection.morph_kernel_size` | int | 5 | 3-11 | Morphological cleanup kernel |
+| `person_detection.association_distance` | float | 150 | 50-500 | Max distance for bib-person matching |
+| `person_detection.typical_person_area` | float | 10000 | 3000-50000 | Area for merged blob estimation |
+
+**CLI flags** (for `test_video_pipeline.py`):
+
+| Flag | Description |
+|------|-------------|
+| `--timing-line x1,y1,x2,y2` | Timing line in normalized coords (enables crossing detection) |
+| `--crossing-direction` | `left_to_right`, `right_to_left`, or `any` (default: `any`) |
+| `--debounce-time` | Seconds between crossings for same track (default: 2.0) |
+| `--no-person-detect` | Disable person detection, use bib tracker for crossings |
+
+---
+
 ### Evidence Capture
 
 ```yaml
@@ -351,6 +410,18 @@ detection:
   crossing_direction: "any"
   debounce_time: 2.0
   max_tracked_bibs: 20
+
+person_detection:
+  enabled: true
+  bg_history: 500
+  bg_var_threshold: 50.0
+  min_area: 2000
+  max_area: 200000
+  min_aspect_ratio: 0.5
+  max_aspect_ratio: 5.0
+  morph_kernel_size: 5
+  association_distance: 150
+  typical_person_area: 10000
 
 evidence:
   capture_mode: "low_confidence"
