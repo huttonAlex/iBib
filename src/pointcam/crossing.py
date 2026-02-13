@@ -427,7 +427,7 @@ class PersistentPersonBibAssociator:
         self,
         max_distance: float = 150.0,
         memory_frames: int = 120,
-        min_votes: int = 3,
+        min_votes: int = 1,
         min_confidence: float = 0.4,
         expected_digit_counts: Optional[set] = None,
     ):

@@ -248,7 +248,48 @@ Frame → YOLOv8n-pose (GPU)     → person tracks (chest keypoint)
 
 ### Milestone 1.4: Basic Video Processing
 
-*Awaiting first entries*
+### Entry 2026-02-13: Pipeline Tuning — UNKNOWN Rate & Duplicate Bibs (Run 1)
+
+**Phase/Milestone**: 1.3 - Pipeline Integration
+
+**Objective**:
+Reduce 60% UNKNOWN rate and 31 duplicate bibs seen on REC-0011-A (30min 5K, 1121 bibs, CRNN OCR, Jetson Orin Nano).
+
+**Root Causes Identified**:
+1. **Bib detector miss (73% of UNKNOWNs)**: People too small/distant. Camera fix needed.
+2. **Association failure (27% of UNKNOWNs)**: Bibs detected near person but not linked. ~24 had stable detections (clear bug).
+3. **Broken confidence system**: `auto_accept_validated` forced any valid bib to 0.90 (HIGH). Voting stability forced `max(conf, 0.85)` (HIGH). Result: 100% of detections were `final_level=high` — confidence levels useless.
+4. **Duplicate bibs**: OCR reads partial numbers (e.g. "65" from "1265"). Since "65" is valid (in 1-1678 range), it passes validation, gets boosted to HIGH, and the 10s dedup window can't catch occurrences minutes apart.
+
+**Changes Made (commit 8a62e6d)**:
+1. `ConfidenceManager.classify()`: replaced floor boosts (`max(conf, 0.90)`) with additive boosts (`+0.15`, `+0.10`)
+2. `PersistentPersonBibAssociator`: weighted votes (HIGH=3, MEDIUM=2, LOW=1), min_votes=3, min_confidence=0.4, short-bib penalty (halved weight for fewer digits than expected)
+3. `BibCrossingDeduplicator`: escalating confidence (1st=any, 2nd>=0.7, 3rd+>=0.9)
+4. Last-chance bib lookup: scan tracked bibs inside person bbox at crossing time
+
+**Results (Run 1: min_votes=3)**:
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| Total crossings | 600 | 564 | -36 |
+| UNKNOWN | 360 (60%) | 394 (70%) | +34 (worse) |
+| Identified | 240 (40%) | 170 (30%) | -70 (worse) |
+| Unique bibs | 161 | 145 | -16 |
+| Duplicate bibs (>1) | 31 | 19 | -12 (better) |
+| Worst duplicate | 65: 16x | 1115: 4x | much better |
+
+Confidence distribution (after fix — was 100% HIGH before):
+- HIGH: 519, MEDIUM: 209, LOW: 217, REJECT: 153
+
+Identified crossing confidence: min=0.40, median=0.84, mean=0.80.
+
+**Analysis**:
+- Duplicates greatly improved: 31→19, worst case 16x→4x. Escalating confidence works.
+- UNKNOWN rate got **worse** (60%→70%): `min_votes=3` is too aggressive. With weighted voting (HIGH=3 per frame), a single high-confidence frame already gives 3 weighted votes, making the threshold redundant for good reads but blocking marginal ones.
+- The confidence system now actually produces meaningful levels (was 100% HIGH, now distributed).
+- Net: traded 70 identifications for 12 fewer duplicates — bad tradeoff.
+
+**Next Step**: Lower `min_votes` from 3 → 1 and rerun. The weighted voting and escalating dedup already handle quality filtering; the min_votes threshold is over-filtering.
 
 ---
 
@@ -364,3 +405,4 @@ Track performance measurements across phases:
 | E006 | 2026-02-04 | 1.1 | Combined dataset | 10,853 total verified | 4 events, 6 cameras, 1-4 digit bibs |
 | E007 | 2026-02-04 | 1.2 | Phase 2.1 pipeline setup | Tooling complete | 4 scripts, 3 candidate models |
 | E008 | 2026-02-13 | 1.3 | YOLOv8n-pose crossing detection | Implementation complete | Replaces MOG2, 41 tests passing |
+| E009 | 2026-02-13 | 1.3 | Pipeline tuning run 1 (min_votes=3) | Dupes 31→19, UNKNOWN 60%→70% | min_votes too aggressive |

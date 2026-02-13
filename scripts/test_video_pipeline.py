@@ -340,7 +340,7 @@ def process_video(
             person_bib_assoc = PersistentPersonBibAssociator(
                 max_distance=150,
                 memory_frames=int(4.0 * fps),  # 4 seconds
-                min_votes=3,
+                min_votes=1,
                 min_confidence=0.4,
                 expected_digit_counts=expected_digits,
             )
