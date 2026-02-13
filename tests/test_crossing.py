@@ -222,41 +222,69 @@ class TestPoseDetector:
 
 class TestPersistentPersonBibAssociator:
     def test_accumulation_and_voting(self):
-        """Votes accumulate over frames and majority wins."""
-        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=100)
+        """Weighted votes accumulate over frames and majority wins."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=3
+        )
         person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
         bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
         consensus = {10: ("1234", 0.95, "high")}
 
-        # Cast multiple votes
+        # Cast multiple votes (HIGH = 3 weight each → 5 frames × 3 = 15 total)
         for i in range(5):
             assoc.update(person_tracked, bib_tracked, consensus, frame_idx=i)
 
         assert assoc.get_bib(1) == "1234"
         assert assoc.get_bib_confidence(1) == 1.0
 
-    def test_majority_voting(self):
-        """The bib with the most votes wins."""
-        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=100)
+    def test_majority_voting_weighted(self):
+        """HIGH votes (weight 3) outweigh MEDIUM votes (weight 2)."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=1
+        )
         person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
         bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
 
-        # 3 votes for "1234"
+        # 2 HIGH votes for "1234" → 2 × 3 = 6 weighted
         consensus_a = {10: ("1234", 0.95, "high")}
-        for i in range(3):
+        for i in range(2):
             assoc.update(person_tracked, bib_tracked, consensus_a, frame_idx=i)
 
-        # 2 votes for "5678"
+        # 3 MEDIUM votes for "5678" → 3 × 2 = 6 weighted (tie, 1234 still wins by order)
+        # Use 4 MEDIUM votes → 4 × 2 = 8 weighted
         consensus_b = {10: ("5678", 0.90, "medium")}
-        for i in range(3, 5):
+        for i in range(2, 6):
             assoc.update(person_tracked, bib_tracked, consensus_b, frame_idx=i)
 
-        assert assoc.get_bib(1) == "1234"
-        assert assoc.get_bib_confidence(1) == pytest.approx(3.0 / 5.0)
+        # 5678 has 8 weighted votes vs 1234's 6 weighted votes → 5678 wins
+        assert assoc.get_bib(1) == "5678"
+
+    def test_low_confidence_votes(self):
+        """LOW confidence gets weight 1 (contributes but doesn't dominate)."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=1
+        )
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+
+        # 5 LOW votes for "1234" → 5 × 1 = 5 weighted
+        consensus_low = {10: ("1234", 0.55, "low")}
+        for i in range(5):
+            assoc.update(person_tracked, bib_tracked, consensus_low, frame_idx=i)
+
+        # 2 HIGH votes for "5678" → 2 × 3 = 6 weighted
+        consensus_high = {10: ("5678", 0.95, "high")}
+        for i in range(5, 7):
+            assoc.update(person_tracked, bib_tracked, consensus_high, frame_idx=i)
+
+        # 5678 wins (6 > 5)
+        assert assoc.get_bib(1) == "5678"
 
     def test_reject_filtered_out(self):
-        """Only 'high' and 'medium' confidence levels produce votes."""
-        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=100)
+        """REJECT confidence level produces zero votes."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=1
+        )
         person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
         bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
         consensus = {10: ("9999", 0.20, "reject")}
@@ -264,9 +292,71 @@ class TestPersistentPersonBibAssociator:
         assoc.update(person_tracked, bib_tracked, consensus, frame_idx=0)
         assert assoc.get_bib(1) is None
 
+    def test_min_votes_threshold(self):
+        """Bib not emitted if below min_votes weighted threshold."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=5
+        )
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+
+        # 1 HIGH vote → 3 weighted (< min_votes=5)
+        consensus = {10: ("1234", 0.95, "high")}
+        assoc.update(person_tracked, bib_tracked, consensus, frame_idx=0)
+        assert assoc.get_bib(1) is None
+
+        # 2nd HIGH vote → 6 weighted (>= min_votes=5)
+        assoc.update(person_tracked, bib_tracked, consensus, frame_idx=1)
+        assert assoc.get_bib(1) == "1234"
+
+    def test_min_confidence_threshold(self):
+        """Bib not emitted if vote fraction is below min_confidence."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=1, min_confidence=0.6
+        )
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+
+        # 1 HIGH vote for "1234" → 3 weighted
+        consensus_a = {10: ("1234", 0.95, "high")}
+        assoc.update(person_tracked, bib_tracked, consensus_a, frame_idx=0)
+
+        # 1 HIGH vote for "5678" → 3 weighted
+        consensus_b = {10: ("5678", 0.95, "high")}
+        assoc.update(person_tracked, bib_tracked, consensus_b, frame_idx=1)
+
+        # 50/50 split → confidence = 0.5 < 0.6 → None
+        assert assoc.get_bib(1) is None
+
+    def test_short_bib_penalty(self):
+        """Short bibs get halved vote weight when expected_digit_counts is set."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200,
+            memory_frames=100,
+            min_votes=1,
+            expected_digit_counts={3, 4},
+        )
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+
+        # 2 HIGH votes for "65" (2-digit, short) → 2 × 3 × 0.5 = 3.0 weighted
+        consensus_short = {10: ("65", 0.90, "high")}
+        for i in range(2):
+            assoc.update(person_tracked, bib_tracked, consensus_short, frame_idx=i)
+
+        # 1 HIGH vote for "1265" (4-digit, normal) → 1 × 3 = 3.0 weighted
+        consensus_normal = {10: ("1265", 0.90, "high")}
+        assoc.update(person_tracked, bib_tracked, consensus_normal, frame_idx=2)
+
+        # Tied at 3.0 each — but one more normal vote tips it
+        assoc.update(person_tracked, bib_tracked, consensus_normal, frame_idx=3)
+        assert assoc.get_bib(1) == "1265"
+
     def test_cleanup_stale_entries(self):
         """Stale entries are removed after memory_frames."""
-        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=10)
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=10, min_votes=1
+        )
         person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
         bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
         consensus = {10: ("1234", 0.95, "high")}
@@ -280,7 +370,9 @@ class TestPersistentPersonBibAssociator:
 
     def test_no_match_when_bib_too_far(self):
         """No votes cast when bib center is too far from person."""
-        assoc = PersistentPersonBibAssociator(max_distance=50, memory_frames=100)
+        assoc = PersistentPersonBibAssociator(
+            max_distance=50, memory_frames=100, min_votes=1
+        )
         person_tracked = {1: ((100.0, 100.0), (50, 50, 150, 150))}
         bib_tracked = {10: ((500.0, 500.0), (480, 480, 520, 520))}
         consensus = {10: ("1234", 0.95, "high")}
@@ -296,21 +388,22 @@ class TestPersistentPersonBibAssociator:
 
 class TestBibCrossingDeduplicator:
     def test_first_crossing_allowed(self):
-        """First crossing for a bib is always emitted."""
+        """First crossing for a bib is always emitted (threshold=0.0)."""
         dedup = BibCrossingDeduplicator(debounce_frames=300)
-        assert dedup.should_emit("1234", frame_idx=100) is True
+        assert dedup.should_emit("1234", frame_idx=100, confidence=0.5) is True
 
     def test_duplicate_suppressed(self):
         """Same bib within debounce window is suppressed."""
         dedup = BibCrossingDeduplicator(debounce_frames=300)
-        assert dedup.should_emit("1234", frame_idx=100) is True
-        assert dedup.should_emit("1234", frame_idx=200) is False
+        assert dedup.should_emit("1234", frame_idx=100, confidence=0.95) is True
+        assert dedup.should_emit("1234", frame_idx=200, confidence=0.95) is False
 
     def test_allowed_after_debounce(self):
-        """Same bib allowed again after debounce expires."""
+        """Same bib allowed again after debounce expires (if confidence high enough)."""
         dedup = BibCrossingDeduplicator(debounce_frames=100)
-        assert dedup.should_emit("1234", frame_idx=100) is True
-        assert dedup.should_emit("1234", frame_idx=250) is True  # 250-100=150 > 100
+        assert dedup.should_emit("1234", frame_idx=100, confidence=0.95) is True
+        # 2nd emission requires >= 0.7 and debounce expired (250-100=150 > 100)
+        assert dedup.should_emit("1234", frame_idx=250, confidence=0.8) is True
 
     def test_unknown_always_passes(self):
         """UNKNOWN bibs are never deduplicated."""
@@ -322,10 +415,35 @@ class TestBibCrossingDeduplicator:
     def test_different_bibs_independent(self):
         """Different bibs are tracked independently."""
         dedup = BibCrossingDeduplicator(debounce_frames=300)
-        assert dedup.should_emit("1234", frame_idx=100) is True
-        assert dedup.should_emit("5678", frame_idx=100) is True
-        assert dedup.should_emit("1234", frame_idx=150) is False
-        assert dedup.should_emit("5678", frame_idx=150) is False
+        assert dedup.should_emit("1234", frame_idx=100, confidence=0.95) is True
+        assert dedup.should_emit("5678", frame_idx=100, confidence=0.95) is True
+        assert dedup.should_emit("1234", frame_idx=150, confidence=0.95) is False
+        assert dedup.should_emit("5678", frame_idx=150, confidence=0.95) is False
+
+    def test_escalating_confidence_2nd_emission(self):
+        """2nd emission of same bib requires confidence >= 0.7."""
+        dedup = BibCrossingDeduplicator(debounce_frames=10)
+        # 1st emission: any confidence
+        assert dedup.should_emit("65", frame_idx=0, confidence=0.5) is True
+        # 2nd emission: debounce expired but confidence too low
+        assert dedup.should_emit("65", frame_idx=100, confidence=0.6) is False
+        # 2nd emission: high enough confidence
+        assert dedup.should_emit("65", frame_idx=200, confidence=0.75) is True
+
+    def test_escalating_confidence_3rd_emission(self):
+        """3rd+ emission requires confidence >= 0.9."""
+        dedup = BibCrossingDeduplicator(debounce_frames=10)
+        assert dedup.should_emit("65", frame_idx=0, confidence=0.95) is True   # 1st
+        assert dedup.should_emit("65", frame_idx=100, confidence=0.85) is True  # 2nd (>=0.7)
+        # 3rd emission: needs 0.9
+        assert dedup.should_emit("65", frame_idx=200, confidence=0.85) is False
+        assert dedup.should_emit("65", frame_idx=300, confidence=0.95) is True  # 3rd (>=0.9)
+
+    def test_default_confidence_backwards_compat(self):
+        """Calling should_emit without confidence defaults to 1.0 (always passes)."""
+        dedup = BibCrossingDeduplicator(debounce_frames=10)
+        assert dedup.should_emit("1234", frame_idx=0) is True
+        assert dedup.should_emit("1234", frame_idx=100) is True  # default conf=1.0 >= 0.7
 
 
 # ---------------------------------------------------------------------------

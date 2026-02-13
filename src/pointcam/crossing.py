@@ -398,24 +398,69 @@ class CrossingDetector:
 
 
 class PersistentPersonBibAssociator:
-    """Accumulates person→bib mapping over time via majority voting.
+    """Accumulates person→bib mapping over time via weighted majority voting.
 
     Each frame, spatial matching links person bboxes to bib bboxes.  For each
-    matched bib, the OCR consensus number is looked up and a vote is cast.
-    ``get_bib(pid)`` returns the bib number with the most votes.
+    matched bib, the OCR consensus number is looked up and a weighted vote is
+    cast.  ``get_bib(pid)`` returns the bib number with the most weighted votes,
+    subject to minimum vote and confidence thresholds.
+
+    Vote weights by confidence level:
+        HIGH: 3, MEDIUM: 2, LOW: 1, REJECT: 0 (skipped).
+
+    Short bib numbers (fewer digits than expected) receive halved vote weight
+    when ``expected_digit_counts`` is provided.
 
     Args:
         max_distance: Max pixel distance for bib-center-to-person-bbox fallback.
         memory_frames: Frames of inactivity before a person entry is cleaned up.
+        min_votes: Minimum weighted votes for the winning bib to be emitted.
+        min_confidence: Minimum vote fraction for the winning bib (0.0-1.0).
+        expected_digit_counts: Set of expected digit counts (e.g. {3, 4}).
+            Bibs with fewer digits than the minimum in this set get halved weight.
     """
 
-    def __init__(self, max_distance: float = 150.0, memory_frames: int = 120):
+    # Weighted votes per confidence level
+    LEVEL_WEIGHTS: Dict[str, int] = {"high": 3, "medium": 2, "low": 1}
+
+    def __init__(
+        self,
+        max_distance: float = 150.0,
+        memory_frames: int = 120,
+        min_votes: int = 3,
+        min_confidence: float = 0.4,
+        expected_digit_counts: Optional[set] = None,
+    ):
         self.max_distance = max_distance
         self.memory_frames = memory_frames
-        # person_track_id → {bib_number → vote_count}
-        self._votes: Dict[int, Dict[str, int]] = {}
+        self.min_votes = min_votes
+        self.min_confidence = min_confidence
+        self.expected_digit_counts = expected_digit_counts
+        # Minimum expected digit count for short-bib penalty
+        self._min_expected_digits: Optional[int] = None
+        if expected_digit_counts:
+            self._min_expected_digits = min(expected_digit_counts)
+        # person_track_id → {bib_number → weighted_vote_count}
+        self._votes: Dict[int, Dict[str, float]] = {}
         # person_track_id → last_frame_seen
         self._last_seen: Dict[int, int] = {}
+
+    def _vote_weight(self, bib_number: str, level: str) -> float:
+        """Compute vote weight for a bib reading.
+
+        Applies level-based weight and short-bib penalty.
+        """
+        base = self.LEVEL_WEIGHTS.get(level, 0)
+        if base == 0:
+            return 0.0
+        weight = float(base)
+        # Short-bib penalty: halve weight for bibs shorter than expected
+        if (
+            self._min_expected_digits is not None
+            and len(bib_number) < self._min_expected_digits
+        ):
+            weight *= 0.5
+        return weight
 
     def update(
         self,
@@ -454,17 +499,33 @@ class PersistentPersonBibAssociator:
 
             if best_bid is not None and best_bid in final_consensus:
                 bib_number, conf, level = final_consensus[best_bid]
-                if level in ("high", "medium"):
+                weight = self._vote_weight(bib_number, level)
+                if weight > 0:
                     if pid not in self._votes:
                         self._votes[pid] = {}
-                    self._votes[pid][bib_number] = self._votes[pid].get(bib_number, 0) + 1
+                    self._votes[pid][bib_number] = (
+                        self._votes[pid].get(bib_number, 0.0) + weight
+                    )
 
     def get_bib(self, person_track_id: int) -> Optional[str]:
-        """Return the majority-voted bib number for *person_track_id*, or None."""
+        """Return the majority-voted bib number, or None if below thresholds.
+
+        Returns None if:
+        - No votes recorded.
+        - Winning bib has fewer than ``min_votes`` weighted votes.
+        - Winning bib's vote fraction is below ``min_confidence``.
+        """
         votes = self._votes.get(person_track_id)
         if not votes:
             return None
-        return max(votes, key=votes.get)
+        winner = max(votes, key=votes.get)  # type: ignore[arg-type]
+        winner_votes = votes[winner]
+        if winner_votes < self.min_votes:
+            return None
+        total = sum(votes.values())
+        if total > 0 and winner_votes / total < self.min_confidence:
+            return None
+        return winner
 
     def get_bib_confidence(self, person_track_id: int) -> float:
         """Return the vote fraction for the winning bib (0.0-1.0)."""
@@ -495,31 +556,65 @@ class PersistentPersonBibAssociator:
 class BibCrossingDeduplicator:
     """Suppresses duplicate crossing events for the same bib number.
 
-    A bib that has already crossed within *debounce_frames* is suppressed.
+    Uses two mechanisms:
+    1. **Frame debounce**: A bib that crossed within *debounce_frames* is suppressed.
+    2. **Escalating confidence**: After the first emission, subsequent emissions
+       require progressively higher confidence — catching partial-bib misreads
+       (e.g. "65" from "1265") that appear many times minutes apart.
+
     ``"UNKNOWN"`` bibs always pass (cannot deduplicate unknowns).
 
     Args:
         debounce_frames: Minimum frames between crossings for the same bib.
+        escalation_thresholds: Confidence thresholds per emission count.
+            Default: 1st=0.0, 2nd>=0.7, 3rd+>=0.9.
     """
 
-    def __init__(self, debounce_frames: int = 300):
+    DEFAULT_ESCALATION = {1: 0.0, 2: 0.7}  # 3+ uses fallback
+    ESCALATION_FALLBACK = 0.9  # Required confidence for 3rd+ emission
+
+    def __init__(
+        self,
+        debounce_frames: int = 300,
+        escalation_thresholds: Optional[Dict[int, float]] = None,
+    ):
         # bib_number → last frame it was reported
         self._recently_crossed: Dict[str, int] = {}
+        # bib_number → total emission count
+        self._emission_count: Dict[str, int] = {}
         self.debounce_frames = debounce_frames
+        self.escalation_thresholds = escalation_thresholds or self.DEFAULT_ESCALATION.copy()
 
-    def should_emit(self, bib_number: str, frame_idx: int) -> bool:
+    def should_emit(
+        self,
+        bib_number: str,
+        frame_idx: int,
+        confidence: float = 1.0,
+    ) -> bool:
         """Return True if this crossing should be emitted (not a duplicate).
 
         Args:
             bib_number: The bib number string (or ``"UNKNOWN"``).
             frame_idx: Current frame number.
+            confidence: Confidence score for this crossing (0.0-1.0).
         """
         if bib_number == "UNKNOWN":
             return True
+
+        # Frame-based debounce
         last = self._recently_crossed.get(bib_number)
         if last is not None and frame_idx - last < self.debounce_frames:
             return False
+
+        # Escalating confidence check
+        count = self._emission_count.get(bib_number, 0)
+        next_count = count + 1
+        required = self.escalation_thresholds.get(next_count, self.ESCALATION_FALLBACK)
+        if confidence < required:
+            return False
+
         self._recently_crossed[bib_number] = frame_idx
+        self._emission_count[bib_number] = next_count
         return True
 
 

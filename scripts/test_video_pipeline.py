@@ -331,9 +331,18 @@ def process_video(
                 device=device,
             )
             person_tracker = CentroidTracker(max_disappeared=15, max_distance=150)
+
+            # Infer expected digit counts for short-bib penalty
+            expected_digits = None
+            if bib_validator:
+                expected_digits = {len(b) for b in bib_validator.bib_set if b}
+
             person_bib_assoc = PersistentPersonBibAssociator(
                 max_distance=150,
                 memory_frames=int(4.0 * fps),  # 4 seconds
+                min_votes=3,
+                min_confidence=0.4,
+                expected_digit_counts=expected_digits,
             )
             print(f"Person detection: ENABLED (YOLOv8n-pose: {pose_model_path})")
         else:
@@ -574,8 +583,22 @@ def process_video(
                     bib_number = person_bib_assoc.get_bib(pid) or "UNKNOWN"
                     confidence = person_bib_assoc.get_bib_confidence(pid)
 
-                    # Bib-level dedup
-                    if not bib_dedup.should_emit(bib_number, frame_idx):
+                    # Last-chance bib lookup: if UNKNOWN, scan tracked bibs
+                    # for any whose center is inside this person's bbox
+                    if bib_number == "UNKNOWN":
+                        px1, py1, px2, py2 = p_bbox
+                        for bid, (b_centroid, b_bbox) in tracked.items():
+                            bcx, bcy = b_centroid
+                            if px1 <= bcx <= px2 and py1 <= bcy <= py2:
+                                if bid in final_consensus:
+                                    fc_number, fc_conf, fc_level = final_consensus[bid]
+                                    if fc_level in ("high", "medium"):
+                                        bib_number = fc_number
+                                        confidence = fc_conf
+                                        break
+
+                    # Bib-level dedup (with escalating confidence)
+                    if not bib_dedup.should_emit(bib_number, frame_idx, confidence):
                         dedup_suppressed += 1
                         continue
 
@@ -619,8 +642,8 @@ def process_video(
                     if track_id in final_consensus:
                         bib_number, confidence, _ = final_consensus[track_id]
 
-                    # Bib-level dedup
-                    if not bib_dedup.should_emit(bib_number, frame_idx):
+                    # Bib-level dedup (with escalating confidence)
+                    if not bib_dedup.should_emit(bib_number, frame_idx, confidence):
                         dedup_suppressed += 1
                         continue
 

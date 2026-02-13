@@ -491,5 +491,6 @@ class TestTier1Integration:
             voting_result=consensus,
         )
 
-        # Should have reduced confidence due to invalid bib
-        assert result.adjusted_confidence < 0.9
+        # Should not exceed original OCR confidence for invalid bib
+        # (additive boosts: -0.1 validation penalty + 0.10 stability = net 0.0)
+        assert result.adjusted_confidence <= 0.9

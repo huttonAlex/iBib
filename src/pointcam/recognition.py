@@ -598,15 +598,17 @@ class ConfidenceManager:
         if validation_result:
             adjusted_confidence += validation_result.confidence_boost
 
-            # If validated and auto-accept enabled, boost to HIGH
+            # If validated and auto-accept enabled, give additive boost
+            # (not a floor — poor OCR with a valid number should not be forced HIGH)
             if self.auto_accept_validated and validation_result.is_valid:
-                adjusted_confidence = max(adjusted_confidence, 0.90)
+                adjusted_confidence += 0.15
 
         # Apply voting adjustment
         if voting_result:
-            # Voting consensus adds significant confidence
+            # Voting consensus adds confidence via additive boosts
+            # (not floors — a stable noisy reading is still noisy)
             if voting_result.is_stable:
-                adjusted_confidence = max(adjusted_confidence, 0.85)
+                adjusted_confidence += 0.10
             elif voting_result.agreement_ratio >= 0.8:
                 adjusted_confidence += 0.05
 
