@@ -291,6 +291,74 @@ Identified crossing confidence: min=0.40, median=0.84, mean=0.80.
 
 **Next Step**: Lower `min_votes` from 3 → 1 and rerun. The weighted voting and escalating dedup already handle quality filtering; the min_votes threshold is over-filtering.
 
+### Entry 2026-02-13: Pipeline Tuning — Run 2 (min_votes=1)
+
+**Phase/Milestone**: 1.3 - Pipeline Integration
+
+**Objective**:
+Test whether lowering `min_votes` from 3 → 1 recovers the lost identifications from Run 1.
+
+**Changes (commit 2d812f5)**:
+- `PersistentPersonBibAssociator` default `min_votes`: 3 → 1
+- Pipeline script: explicit `min_votes=1`
+
+**Results (Run 2: min_votes=1)**:
+
+| Metric | Before | Run 1 (mv=3) | Run 2 (mv=1) | Run 2 vs Before |
+|---|---|---|---|---|
+| Total crossings | 600 | 564 | 563 | -37 |
+| UNKNOWN | 360 (60%) | 394 (70%) | 388 (69%) | +28 (worse) |
+| Identified | 240 (40%) | 170 (30%) | 175 (31%) | -65 (worse) |
+| Unique bibs | 161 | 145 | 147 | -14 |
+| Duplicates (>1) | 31 | 19 | 20 | -11 (better) |
+| Worst dup | 65: 16x | 1115: 4x | 15: 5x | much better |
+
+**Analysis**:
+- Lowering `min_votes` was marginal: only +5 identifications (170→175).
+- The identification drop is NOT caused by `min_votes`. The bottleneck is elsewhere — likely the confidence changes (additive boosts instead of floors) and/or escalating dedup suppressing real bibs.
+- Duplicate fix remains solid: 31→20 with worst case 16x→5x.
+- Need deeper investigation to find which specific change is dropping identifications.
+
+### Entry 2026-02-13: Root Cause Analysis — Identification Drop (240→175)
+
+**Phase/Milestone**: 1.3 - Pipeline Integration
+
+**Objective**:
+Understand why identified crossings dropped from 240→175 despite only targeting duplicates.
+
+**Method**:
+Time-matched crossings between old and new runs (±5s window). Cross-referenced with detection CSVs to trace where bibs disappeared.
+
+**Findings**:
+
+1. **Broken confidence floor was the primary inflator in the old run.**
+   Old run: 100% of tracks (1098/1098) classified as `final_level=high`. New run: HIGH=519, MEDIUM=209, LOW=217, REJECT=153. The old code had no real tiering — everything was forced to HIGH.
+
+2. **57% of "lost" crossings were phantom duplicates.**
+   Of 150 lost crossings matched by time, 85 came from bibs with multiple crossings in the old run (65: 16x, 15: 10x, 35: 9x, 45: 8x). These are clearly OCR fragment misreads that got accepted due to the broken confidence floor.
+
+3. **63 of 93 "lost" bib numbers don't appear in new detections at all.**
+   Numbers like 25, 35, 55, 51 — suspiciously common 2-digit OCR fragments (e.g. "35" from "1350"). The old floor (conf=1.0) accepted them; the new code correctly rejects them.
+
+4. **Old conf=1.0 floor directly responsible for 33 lost crossings.**
+   50/240 old identified crossings had confidence exactly 1.0. Of those, 33 were lost. Old confidence range: 0.129-1.0. New range: 0.400-1.0.
+
+5. **~30 bibs are still detected but not identified at crossing time.**
+   Bibs like 65, 15, 45 have thousands of detection rows with high OCR confidence, but fail to get assigned to a person at crossing. Possible causes: short-bib penalty reducing their vote weight, or these are OCR misreads on other people's bibs that are correctly filtered.
+
+**Analysis**:
+The drop from 240→175 is **mostly correct behavior**. The old 240 was inflated by:
+- Broken confidence floor accepting everything as HIGH
+- No tiering, so garbage OCR reads passed
+- Massive duplicate crossings (65 crossing 16x)
+
+Adjusted for duplicates, the old run had ~161 unique identified bibs → new has 147. True net loss: ~14 unique bibs, not 65.
+
+**Implications for Project**:
+- The confidence and dedup fixes are working as intended
+- The ~30 bibs detected but not crossing as identified may benefit from tuning the short-bib penalty or the last-chance lookup
+- Camera angle improvement remains the highest-impact change for UNKNOWN rate (73% of UNKNOWNs are detector misses)
+
 ---
 
 ## Phase 2: Real-World Testing
@@ -406,3 +474,5 @@ Track performance measurements across phases:
 | E007 | 2026-02-04 | 1.2 | Phase 2.1 pipeline setup | Tooling complete | 4 scripts, 3 candidate models |
 | E008 | 2026-02-13 | 1.3 | YOLOv8n-pose crossing detection | Implementation complete | Replaces MOG2, 41 tests passing |
 | E009 | 2026-02-13 | 1.3 | Pipeline tuning run 1 (min_votes=3) | Dupes 31→19, UNKNOWN 60%→70% | min_votes too aggressive |
+| E010 | 2026-02-13 | 1.3 | Pipeline tuning run 2 (min_votes=1) | Dupes 31→20, UNKNOWN 60%→69% | min_votes not the bottleneck |
+| E011 | 2026-02-13 | 1.3 | Identification drop root cause | 57% were phantom dupes, rest OCR misreads | Drop is mostly correct behavior |
