@@ -5,8 +5,9 @@ Runs YOLOv8 bib detector + PARSeq/CRNN OCR on each frame with:
 - Bib set validation (reject impossible numbers)
 - Multi-frame voting (temporal consistency)
 - Confidence thresholding (flag uncertain reads)
-- Person detection via background subtraction (optional)
-- Timing-line crossing detection
+- Person detection via YOLOv8n-pose (chest keypoint crossing)
+- Persistent person-bib association with temporal voting
+- Bib-level dedup to prevent double-counting
 
 Outputs annotated video, detection log, crossing log, and review queue.
 
@@ -46,14 +47,14 @@ from pointcam.recognition import (
     BibCompletenessChecker,
 )
 from pointcam.crossing import (
+    BibCrossingDeduplicator,
     CentroidTracker,
-    TimingLine,
     CrossingDetector,
-    BackgroundSubtractorManager,
-    PersonBibAssociator,
-    MergedBlobEstimator,
     CrossingEvent,
     CrossingEventLog,
+    PersistentPersonBibAssociator,
+    PoseDetector,
+    TimingLine,
 )
 
 
@@ -178,6 +179,7 @@ def process_video(
     crossing_direction: str = "any",
     debounce_time: float = 2.0,
     enable_person_detect: bool = True,
+    pose_model_path: str = "yolov8n-pose.pt",
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -297,14 +299,16 @@ def process_video(
     # --- Person detection + crossing detection (optional) ---
     timing_line = None
     crossing_detector = None
-    bg_manager = None
+    pose_detector = None
     person_tracker = None
     person_bib_assoc = None
-    blob_estimator = None
+    bib_dedup = None
     crossing_log = None
     crossing_seq = 0
     total_crossings = 0
     unknown_crossings = 0
+    dedup_suppressed = 0
+    total_pose_time = 0.0
 
     if timing_line_coords is not None:
         timing_line = TimingLine(*timing_line_coords)
@@ -317,14 +321,23 @@ def process_video(
         print(f"Timing line: {timing_line_coords}, direction={crossing_direction}")
         print(f"Debounce: {debounce_time}s ({debounce_frames} frames)")
 
+        # Bib-level deduplication (10s worth of frames)
+        bib_dedup = BibCrossingDeduplicator(debounce_frames=int(10.0 * fps))
+
         if enable_person_detect:
-            bg_manager = BackgroundSubtractorManager()
+            pose_detector = PoseDetector(
+                model_path=pose_model_path,
+                conf=0.5,
+                device=device,
+            )
             person_tracker = CentroidTracker(max_disappeared=15, max_distance=150)
-            person_bib_assoc = PersonBibAssociator(max_distance=150)
-            blob_estimator = MergedBlobEstimator()
-            print("Person detection: ENABLED (MOG2 background subtraction)")
+            person_bib_assoc = PersistentPersonBibAssociator(
+                max_distance=150,
+                memory_frames=int(4.0 * fps),  # 4 seconds
+            )
+            print(f"Person detection: ENABLED (YOLOv8n-pose: {pose_model_path})")
         else:
-            print("Person detection: DISABLED")
+            print("Person detection: DISABLED (bib-tracker crossings)")
 
         crossing_log_path = output_dir / f"{Path(video_path).stem}_crossings.csv"
         crossing_log = CrossingEventLog(crossing_log_path)
@@ -538,27 +551,33 @@ def process_video(
             )
 
         # --- Person detection + crossing detection ---
-        if bg_manager is not None:
-            person_bboxes = bg_manager.process(frame)
-            person_tracked = person_tracker.update(person_bboxes)
+        if pose_detector is not None:
+            t_pose_start = time.perf_counter()
+            person_dets = pose_detector.detect(frame)
+            t_pose_end = time.perf_counter()
+            total_pose_time += t_pose_end - t_pose_start
 
-            # Associate persons with bibs
-            associations = person_bib_assoc.associate(person_tracked, tracked)
+            # Update person tracker using chest points as centroids
+            p_bboxes = [d.bbox for d in person_dets]
+            p_chests = [d.chest_point for d in person_dets]
+            person_tracked = person_tracker.update(p_bboxes, centroids=p_chests)
 
-            # Check each person for crossing
+            # Accumulate person→bib associations via voting
+            person_bib_assoc.update(person_tracked, tracked, final_consensus, frame_idx)
+
+            # Check each person for crossing (using chest point)
             for pid, (p_centroid, p_bbox) in person_tracked.items():
                 cx_norm = p_centroid[0] / width
                 cy_norm = p_centroid[1] / height
 
                 if crossing_detector.check(pid, cx_norm, cy_norm, frame_idx):
-                    bib_track_id = associations.get(pid)
-                    bib_number = "UNKNOWN"
-                    confidence = 0.0
+                    bib_number = person_bib_assoc.get_bib(pid) or "UNKNOWN"
+                    confidence = person_bib_assoc.get_bib_confidence(pid)
 
-                    if bib_track_id is not None and bib_track_id in final_consensus:
-                        bib_number, confidence, _ = final_consensus[bib_track_id]
-
-                    est_count = blob_estimator.estimate(p_bbox)
+                    # Bib-level dedup
+                    if not bib_dedup.should_emit(bib_number, frame_idx):
+                        dedup_suppressed += 1
+                        continue
 
                     crossing_seq += 1
                     event = CrossingEvent(
@@ -568,21 +587,25 @@ def process_video(
                         person_track_id=pid,
                         bib_number=bib_number,
                         confidence=confidence,
-                        estimated_count=est_count,
                         person_bbox=p_bbox,
+                        chest_point=p_centroid,
+                        source="pose",
                     )
                     crossing_log.write(event)
                     total_crossings += 1
                     if bib_number == "UNKNOWN":
                         unknown_crossings += 1
 
-            # Cleanup stale crossing detector state
+            # Cleanup stale state
             crossing_detector.cleanup(set(person_tracked.keys()))
+            person_bib_assoc.cleanup(frame_idx)
 
-            # Draw person blobs (cyan)
+            # Draw person bboxes (cyan) + chest points (magenta dots)
             for pid, (p_centroid, p_bbox) in person_tracked.items():
                 px1, py1, px2, py2 = p_bbox
                 cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 255, 0), 1)
+                cx, cy = int(p_centroid[0]), int(p_centroid[1])
+                cv2.circle(frame, (cx, cy), 5, (255, 0, 255), -1)
 
         elif crossing_detector is not None:
             # No person detection — use bib tracker for crossings instead
@@ -596,6 +619,11 @@ def process_video(
                     if track_id in final_consensus:
                         bib_number, confidence, _ = final_consensus[track_id]
 
+                    # Bib-level dedup
+                    if not bib_dedup.should_emit(bib_number, frame_idx):
+                        dedup_suppressed += 1
+                        continue
+
                     crossing_seq += 1
                     event = CrossingEvent(
                         sequence=crossing_seq,
@@ -605,6 +633,7 @@ def process_video(
                         bib_number=bib_number,
                         confidence=confidence,
                         person_bbox=bbox,
+                        source="bib_tracker",
                     )
                     crossing_log.write(event)
                     total_crossings += 1
@@ -694,8 +723,11 @@ def process_video(
         print(f"  Total crossings: {total_crossings}")
         print(f"  With bib: {total_crossings - unknown_crossings}")
         print(f"  UNKNOWN (no bib): {unknown_crossings}")
+        print(f"  Dedup suppressed: {dedup_suppressed}")
         if person_tracker is not None:
             print(f"  Person tracks: {person_tracker.next_id}")
+        if pose_detector is not None:
+            print(f"  Avg pose time: {1000 * total_pose_time / frame_idx:.1f} ms/frame")
 
     print(f"\nOutputs:")
     if write_video:
@@ -802,6 +834,12 @@ def main():
         action="store_true",
         help="Disable person detection (use bib tracker for crossings instead)",
     )
+    parser.add_argument(
+        "--pose-model",
+        type=str,
+        default="yolov8n-pose.pt",
+        help="Path to YOLOv8-pose weights (default: yolov8n-pose.pt, auto-downloaded)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -894,6 +932,7 @@ def main():
         crossing_direction=args.crossing_direction,
         debounce_time=args.debounce_time,
         enable_person_detect=not args.no_person_detect,
+        pose_model_path=args.pose_model,
     )
 
     print("\nDone!")

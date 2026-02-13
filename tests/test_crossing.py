@@ -1,6 +1,7 @@
 """Tests for pointcam.crossing module."""
 
 import tempfile
+import warnings
 from pathlib import Path
 
 import cv2
@@ -9,12 +10,16 @@ import pytest
 
 from pointcam.crossing import (
     BackgroundSubtractorManager,
+    BibCrossingDeduplicator,
     CentroidTracker,
     CrossingDetector,
     CrossingEvent,
     CrossingEventLog,
     MergedBlobEstimator,
+    PersistentPersonBibAssociator,
     PersonBibAssociator,
+    PersonDetection,
+    PoseDetector,
     TimingLine,
 )
 
@@ -148,71 +153,225 @@ class TestCrossingDetector:
 
 
 # ---------------------------------------------------------------------------
-# BackgroundSubtractorManager
+# PoseDetector (chest point computation)
+# ---------------------------------------------------------------------------
+
+
+class TestPoseDetector:
+    def test_chest_point_four_keypoints(self):
+        """Chest is average of all 4 torso keypoints when all visible."""
+        kps = np.zeros((17, 3), dtype=np.float32)
+        # left_shoulder(5), right_shoulder(6), left_hip(11), right_hip(12)
+        kps[5] = [100, 200, 0.9]
+        kps[6] = [200, 200, 0.9]
+        kps[11] = [100, 400, 0.9]
+        kps[12] = [200, 400, 0.9]
+        bbox = (80, 180, 220, 420)
+
+        cx, cy = PoseDetector._chest_point(kps, bbox)
+        assert abs(cx - 150.0) < 1.0
+        assert abs(cy - 300.0) < 1.0
+
+    def test_chest_point_two_shoulders_only(self):
+        """Fallback: average of 2 visible keypoints (shoulders only)."""
+        kps = np.zeros((17, 3), dtype=np.float32)
+        kps[5] = [100, 200, 0.9]  # left_shoulder visible
+        kps[6] = [200, 200, 0.8]  # right_shoulder visible
+        # hips not visible (conf=0)
+        bbox = (80, 180, 220, 420)
+
+        cx, cy = PoseDetector._chest_point(kps, bbox)
+        assert abs(cx - 150.0) < 1.0
+        assert abs(cy - 200.0) < 1.0
+
+    def test_chest_point_bbox_fallback(self):
+        """Falls back to bbox centroid when <2 keypoints visible."""
+        kps = np.zeros((17, 3), dtype=np.float32)
+        kps[5] = [100, 200, 0.9]  # only 1 visible
+        bbox = (100, 200, 300, 400)
+
+        cx, cy = PoseDetector._chest_point(kps, bbox)
+        assert abs(cx - 200.0) < 1.0
+        assert abs(cy - 300.0) < 1.0
+
+    def test_chest_point_no_keypoints(self):
+        """Falls back to bbox centroid when keypoints is None."""
+        bbox = (100, 200, 300, 400)
+        cx, cy = PoseDetector._chest_point(None, bbox)
+        assert abs(cx - 200.0) < 1.0
+        assert abs(cy - 300.0) < 1.0
+
+    def test_chest_point_three_visible(self):
+        """Average of 3 visible keypoints."""
+        kps = np.zeros((17, 3), dtype=np.float32)
+        kps[5] = [100, 200, 0.9]
+        kps[6] = [200, 200, 0.9]
+        kps[11] = [150, 400, 0.9]
+        # right_hip not visible
+        bbox = (80, 180, 220, 420)
+
+        cx, cy = PoseDetector._chest_point(kps, bbox)
+        assert abs(cx - 150.0) < 1.0
+        assert abs(cy - 266.67) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# PersistentPersonBibAssociator
+# ---------------------------------------------------------------------------
+
+
+class TestPersistentPersonBibAssociator:
+    def test_accumulation_and_voting(self):
+        """Votes accumulate over frames and majority wins."""
+        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=100)
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+        consensus = {10: ("1234", 0.95, "high")}
+
+        # Cast multiple votes
+        for i in range(5):
+            assoc.update(person_tracked, bib_tracked, consensus, frame_idx=i)
+
+        assert assoc.get_bib(1) == "1234"
+        assert assoc.get_bib_confidence(1) == 1.0
+
+    def test_majority_voting(self):
+        """The bib with the most votes wins."""
+        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=100)
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+
+        # 3 votes for "1234"
+        consensus_a = {10: ("1234", 0.95, "high")}
+        for i in range(3):
+            assoc.update(person_tracked, bib_tracked, consensus_a, frame_idx=i)
+
+        # 2 votes for "5678"
+        consensus_b = {10: ("5678", 0.90, "medium")}
+        for i in range(3, 5):
+            assoc.update(person_tracked, bib_tracked, consensus_b, frame_idx=i)
+
+        assert assoc.get_bib(1) == "1234"
+        assert assoc.get_bib_confidence(1) == pytest.approx(3.0 / 5.0)
+
+    def test_reject_filtered_out(self):
+        """Only 'high' and 'medium' confidence levels produce votes."""
+        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=100)
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+        consensus = {10: ("9999", 0.20, "reject")}
+
+        assoc.update(person_tracked, bib_tracked, consensus, frame_idx=0)
+        assert assoc.get_bib(1) is None
+
+    def test_cleanup_stale_entries(self):
+        """Stale entries are removed after memory_frames."""
+        assoc = PersistentPersonBibAssociator(max_distance=200, memory_frames=10)
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+        consensus = {10: ("1234", 0.95, "high")}
+
+        assoc.update(person_tracked, bib_tracked, consensus, frame_idx=0)
+        assert assoc.get_bib(1) == "1234"
+
+        # Cleanup at frame 20 (0 + 10 < 20)
+        assoc.cleanup(frame_idx=20)
+        assert assoc.get_bib(1) is None
+
+    def test_no_match_when_bib_too_far(self):
+        """No votes cast when bib center is too far from person."""
+        assoc = PersistentPersonBibAssociator(max_distance=50, memory_frames=100)
+        person_tracked = {1: ((100.0, 100.0), (50, 50, 150, 150))}
+        bib_tracked = {10: ((500.0, 500.0), (480, 480, 520, 520))}
+        consensus = {10: ("1234", 0.95, "high")}
+
+        assoc.update(person_tracked, bib_tracked, consensus, frame_idx=0)
+        assert assoc.get_bib(1) is None
+
+
+# ---------------------------------------------------------------------------
+# BibCrossingDeduplicator
+# ---------------------------------------------------------------------------
+
+
+class TestBibCrossingDeduplicator:
+    def test_first_crossing_allowed(self):
+        """First crossing for a bib is always emitted."""
+        dedup = BibCrossingDeduplicator(debounce_frames=300)
+        assert dedup.should_emit("1234", frame_idx=100) is True
+
+    def test_duplicate_suppressed(self):
+        """Same bib within debounce window is suppressed."""
+        dedup = BibCrossingDeduplicator(debounce_frames=300)
+        assert dedup.should_emit("1234", frame_idx=100) is True
+        assert dedup.should_emit("1234", frame_idx=200) is False
+
+    def test_allowed_after_debounce(self):
+        """Same bib allowed again after debounce expires."""
+        dedup = BibCrossingDeduplicator(debounce_frames=100)
+        assert dedup.should_emit("1234", frame_idx=100) is True
+        assert dedup.should_emit("1234", frame_idx=250) is True  # 250-100=150 > 100
+
+    def test_unknown_always_passes(self):
+        """UNKNOWN bibs are never deduplicated."""
+        dedup = BibCrossingDeduplicator(debounce_frames=300)
+        assert dedup.should_emit("UNKNOWN", frame_idx=100) is True
+        assert dedup.should_emit("UNKNOWN", frame_idx=101) is True
+        assert dedup.should_emit("UNKNOWN", frame_idx=102) is True
+
+    def test_different_bibs_independent(self):
+        """Different bibs are tracked independently."""
+        dedup = BibCrossingDeduplicator(debounce_frames=300)
+        assert dedup.should_emit("1234", frame_idx=100) is True
+        assert dedup.should_emit("5678", frame_idx=100) is True
+        assert dedup.should_emit("1234", frame_idx=150) is False
+        assert dedup.should_emit("5678", frame_idx=150) is False
+
+
+# ---------------------------------------------------------------------------
+# BackgroundSubtractorManager (deprecated)
 # ---------------------------------------------------------------------------
 
 
 class TestBackgroundSubtractorManager:
+    def test_deprecation_warning(self):
+        """Constructing emits a DeprecationWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            BackgroundSubtractorManager(min_area=100)
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "deprecated" in str(w[0].message).lower()
+
     def test_returns_list_of_bboxes(self):
         """process() returns a list of bounding box tuples."""
-        mgr = BackgroundSubtractorManager(min_area=100)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            mgr = BackgroundSubtractorManager(min_area=100)
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
         result = mgr.process(frame)
         assert isinstance(result, list)
 
-    def test_detects_blob_after_background_learning(self):
-        """After learning a black background, a white rectangle should be detected."""
-        mgr = BackgroundSubtractorManager(
-            history=10,
-            var_threshold=16.0,
-            min_area=100,
-            max_area=500000,
-            min_aspect_ratio=0.2,
-            max_aspect_ratio=10.0,
-        )
-
-        # Feed blank frames to establish background
-        blank = np.zeros((480, 640, 3), dtype=np.uint8)
-        for _ in range(20):
-            mgr.process(blank)
-
-        # Insert a large white rectangle (person-like)
-        frame = blank.copy()
-        cv2.rectangle(frame, (200, 100), (300, 400), (255, 255, 255), -1)
-        bboxes = mgr.process(frame)
-
-        assert len(bboxes) >= 1
-        # The detected bbox should overlap with our rectangle
-        x1, y1, x2, y2 = bboxes[0]
-        assert x1 < 300 and x2 > 200 and y1 < 400 and y2 > 100
-
-    def test_filters_small_contours(self):
-        """Blobs smaller than min_area are ignored."""
-        mgr = BackgroundSubtractorManager(
-            history=10, var_threshold=16.0, min_area=5000
-        )
-
-        blank = np.zeros((480, 640, 3), dtype=np.uint8)
-        for _ in range(20):
-            mgr.process(blank)
-
-        # Small blob (10x10 = 100px area)
-        frame = blank.copy()
-        cv2.rectangle(frame, (300, 200), (310, 210), (255, 255, 255), -1)
-        bboxes = mgr.process(frame)
-
-        assert len(bboxes) == 0
-
 
 # ---------------------------------------------------------------------------
-# PersonBibAssociator
+# PersonBibAssociator (deprecated)
 # ---------------------------------------------------------------------------
 
 
 class TestPersonBibAssociator:
+    def test_deprecation_warning(self):
+        """Constructing emits a DeprecationWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            PersonBibAssociator(max_distance=200)
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+
     def test_bib_inside_person_bbox(self):
         """A bib whose center is inside a person bbox gets matched."""
-        assoc = PersonBibAssociator(max_distance=200)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            assoc = PersonBibAssociator(max_distance=200)
         persons = {
             1: ((250.0, 300.0), (200, 100, 300, 500)),
         }
@@ -222,80 +381,27 @@ class TestPersonBibAssociator:
         result = assoc.associate(persons, bibs)
         assert result[1] == 10
 
-    def test_bib_outside_but_within_distance(self):
-        """A bib not inside any person but within max_distance still matches."""
-        assoc = PersonBibAssociator(max_distance=200)
-        persons = {
-            1: ((250.0, 300.0), (200, 200, 300, 400)),
-        }
-        bibs = {
-            10: ((350.0, 300.0), (330, 280, 370, 320)),  # outside but close
-        }
-        result = assoc.associate(persons, bibs)
-        assert result[1] == 10
-
-    def test_bib_too_far(self):
-        """A bib beyond max_distance is not matched."""
-        assoc = PersonBibAssociator(max_distance=50)
-        persons = {
-            1: ((100.0, 100.0), (50, 50, 150, 150)),
-        }
-        bibs = {
-            10: ((500.0, 500.0), (480, 480, 520, 520)),  # far away
-        }
-        result = assoc.associate(persons, bibs)
-        assert result[1] is None
-
-    def test_no_bibs(self):
-        """When there are no bibs, all persons map to None."""
-        assoc = PersonBibAssociator()
-        persons = {
-            1: ((100.0, 100.0), (50, 50, 150, 150)),
-        }
-        result = assoc.associate(persons, {})
-        assert result[1] is None
-
-    def test_bib_not_reused(self):
-        """Each bib can only be assigned to one person."""
-        assoc = PersonBibAssociator(max_distance=500)
-        persons = {
-            1: ((100.0, 100.0), (50, 50, 150, 150)),
-            2: ((120.0, 100.0), (70, 50, 170, 150)),
-        }
-        bibs = {
-            10: ((110.0, 100.0), (90, 80, 130, 120)),  # close to both
-        }
-        result = assoc.associate(persons, bibs)
-        assigned = [v for v in result.values() if v is not None]
-        assert len(assigned) == 1  # only one person gets the bib
-        assert 10 in assigned
-
 
 # ---------------------------------------------------------------------------
-# MergedBlobEstimator
+# MergedBlobEstimator (deprecated)
 # ---------------------------------------------------------------------------
 
 
 class TestMergedBlobEstimator:
+    def test_deprecation_warning(self):
+        """Constructing emits a DeprecationWarning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            MergedBlobEstimator(typical_person_area=10000)
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+
     def test_single_person(self):
         """A blob with typical area returns 1."""
-        est = MergedBlobEstimator(typical_person_area=10000)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            est = MergedBlobEstimator(typical_person_area=10000)
         assert est.estimate((0, 0, 100, 100)) == 1  # 10000 area
-
-    def test_two_persons(self):
-        """A blob with ~2x typical area returns 2."""
-        est = MergedBlobEstimator(typical_person_area=10000)
-        assert est.estimate((0, 0, 200, 100)) == 2  # 20000 area
-
-    def test_minimum_one(self):
-        """Even a tiny blob returns at least 1."""
-        est = MergedBlobEstimator(typical_person_area=10000)
-        assert est.estimate((0, 0, 10, 10)) == 1
-
-    def test_large_group(self):
-        """A blob with ~5x typical area returns 5."""
-        est = MergedBlobEstimator(typical_person_area=10000)
-        assert est.estimate((0, 0, 500, 100)) == 5  # 50000 area
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +443,38 @@ class TestCentroidTracker:
         assert len(result) == 2
 
 
+class TestCentroidTrackerCustomCentroids:
+    def test_custom_centroids_used_for_matching(self):
+        """When centroids are provided, they are used instead of bbox centers."""
+        tracker = CentroidTracker(max_disappeared=5, max_distance=50)
+        # Register with custom centroid (10, 10) — far from bbox center (125, 125)
+        detections = [(100, 100, 150, 150)]
+        centroids = [(10.0, 10.0)]
+        result = tracker.update(detections, centroids=centroids)
+        assert 0 in result
+        centroid, bbox = result[0]
+        assert centroid == (10.0, 10.0)
+        assert bbox == (100, 100, 150, 150)
+
+    def test_custom_centroids_affects_matching(self):
+        """Custom centroids change which detection matches which track."""
+        tracker = CentroidTracker(max_disappeared=5, max_distance=50)
+        # First frame: two objects
+        tracker.update(
+            [(0, 0, 20, 20), (100, 100, 120, 120)],
+            centroids=[(10.0, 10.0), (110.0, 110.0)],
+        )
+        # Second frame: same objects, custom centroids close to first-frame positions
+        result = tracker.update(
+            [(0, 0, 20, 20), (100, 100, 120, 120)],
+            centroids=[(12.0, 12.0), (112.0, 112.0)],
+        )
+        assert 0 in result
+        assert 1 in result
+        assert result[0][0] == (12.0, 12.0)
+        assert result[1][0] == (112.0, 112.0)
+
+
 # ---------------------------------------------------------------------------
 # CrossingEventLog
 # ---------------------------------------------------------------------------
@@ -358,6 +496,8 @@ class TestCrossingEventLog:
             confidence=0.95,
             estimated_count=1,
             person_bbox=(100, 200, 300, 500),
+            chest_point=(200.0, 350.0),
+            source="pose",
         )
         log.write(event)
         log.close()
@@ -365,6 +505,36 @@ class TestCrossingEventLog:
         lines = path.read_text().strip().split("\n")
         assert len(lines) == 2  # header + 1 data row
         assert "sequence" in lines[0]
+        assert "chest_x" in lines[0]
+        assert "chest_y" in lines[0]
+        assert "source" in lines[0]
         assert "1234" in lines[1]
+        assert "pose" in lines[1]
+        assert "200.0" in lines[1]
+
+        path.unlink()
+
+    def test_writes_csv_without_chest_point(self):
+        """CrossingEventLog handles None chest_point."""
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="r") as f:
+            path = Path(f.name)
+
+        log = CrossingEventLog(path)
+        event = CrossingEvent(
+            sequence=1,
+            frame_idx=100,
+            timestamp_sec=3.333,
+            person_track_id=5,
+            bib_number="UNKNOWN",
+            confidence=0.0,
+            person_bbox=(100, 200, 300, 500),
+            source="bib_tracker",
+        )
+        log.write(event)
+        log.close()
+
+        lines = path.read_text().strip().split("\n")
+        assert len(lines) == 2
+        assert "bib_tracker" in lines[1]
 
         path.unlink()

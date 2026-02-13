@@ -1,22 +1,29 @@
 """Person detection and timing-line crossing detection.
 
-Software-only approach using OpenCV background subtraction + blob tracking.
-Zero additional GPU cost (~3-5ms CPU overhead per frame).
+YOLOv8n-pose for person detection (chest keypoint crossing) with persistent
+bib association and bib-level deduplication.  Legacy MOG2 blob approach kept
+but deprecated.
 
 Classes:
-    TimingLine           - Virtual line for crossing math
-    CrossingDetector     - Fires when a tracked centroid crosses the timing line
-    BackgroundSubtractorManager - MOG2 + morphological cleanup, person-sized blobs
-    PersonBibAssociator  - Matches person blobs to bib detections by spatial proximity
-    MergedBlobEstimator  - Estimates person count in merged blobs via area heuristic
-    CrossingEvent        - Dataclass for a single crossing event
-    CrossingEventLog     - Writes crossing events to CSV
-    CentroidTracker      - Simple centroid-based object tracker
+    CentroidTracker              - Simple centroid-based object tracker
+    PersonDetection              - Dataclass for a single pose detection
+    PoseDetector                 - YOLOv8n-pose wrapper, extracts chest point
+    TimingLine                   - Virtual line for crossing math
+    CrossingDetector             - Fires when a tracked centroid crosses the timing line
+    PersistentPersonBibAssociator - Accumulates person→bib mapping over time via voting
+    BibCrossingDeduplicator      - Prevents same bib from firing twice
+    CrossingEvent                - Dataclass for a single crossing event
+    CrossingEventLog             - Writes crossing events to CSV
+    BackgroundSubtractorManager  - (deprecated) MOG2 + morphological cleanup
+    PersonBibAssociator          - (deprecated) Stateless spatial matching
+    MergedBlobEstimator          - (deprecated) Area-based person count
 """
 
 from __future__ import annotations
 
 import csv
+import logging
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +31,8 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -61,12 +70,17 @@ class CentroidTracker:
         del self.disappeared[object_id]
 
     def update(
-        self, detections: List[Tuple[int, int, int, int]]
+        self,
+        detections: List[Tuple[int, int, int, int]],
+        centroids: Optional[List[Tuple[float, float]]] = None,
     ) -> Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]]:
         """Update tracker with new detections.
 
         Args:
             detections: List of (x1, y1, x2, y2) bounding boxes.
+            centroids: Optional pre-computed centroids (e.g. chest points from pose).
+                If provided, must be same length as *detections*.  When ``None``,
+                centroids are computed as bbox centers.
 
         Returns:
             Dict of {track_id: (centroid, bbox)}.
@@ -78,12 +92,15 @@ class CentroidTracker:
                     self.deregister(object_id)
             return {oid: (self.objects[oid], self.bboxes[oid]) for oid in self.objects}
 
-        # Calculate centroids
-        input_centroids = []
-        for x1, y1, x2, y2 in detections:
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            input_centroids.append((cx, cy))
+        # Calculate centroids (or use provided ones)
+        if centroids is not None:
+            input_centroids = list(centroids)
+        else:
+            input_centroids = []
+            for x1, y1, x2, y2 in detections:
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                input_centroids.append((cx, cy))
 
         if len(self.objects) == 0:
             for i, centroid in enumerate(input_centroids):
@@ -131,6 +148,123 @@ class CentroidTracker:
                 self.register(input_centroids[col], detections[col])
 
         return {oid: (self.objects[oid], self.bboxes[oid]) for oid in self.objects}
+
+
+# ---------------------------------------------------------------------------
+# PersonDetection (dataclass)
+# ---------------------------------------------------------------------------
+
+
+# COCO keypoint indices for torso
+_KP_LEFT_SHOULDER = 5
+_KP_RIGHT_SHOULDER = 6
+_KP_LEFT_HIP = 11
+_KP_RIGHT_HIP = 12
+_TORSO_INDICES = [_KP_LEFT_SHOULDER, _KP_RIGHT_SHOULDER, _KP_LEFT_HIP, _KP_RIGHT_HIP]
+
+# Minimum keypoint confidence to consider a keypoint "visible"
+_KP_CONF_THRESHOLD = 0.3
+
+
+@dataclass
+class PersonDetection:
+    """A single person detection from YOLOv8n-pose."""
+
+    bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
+    confidence: float
+    chest_point: Tuple[float, float]  # (cx, cy) in pixel coords
+    keypoints: Optional[np.ndarray] = None  # (17, 3) array or None
+
+
+# ---------------------------------------------------------------------------
+# PoseDetector
+# ---------------------------------------------------------------------------
+
+
+class PoseDetector:
+    """Wraps YOLOv8n-pose to detect persons and extract chest keypoints.
+
+    Chest point = midpoint of visible torso keypoints (COCO indices:
+    left_shoulder=5, right_shoulder=6, left_hip=11, right_hip=12).
+
+    Fallback chain:
+        1. Average of all visible torso keypoints (if >=2 visible)
+        2. Bbox centroid (if <2 keypoints visible)
+
+    Args:
+        model_path: Path to YOLOv8n-pose weights (e.g. ``yolov8n-pose.pt``).
+        conf: Minimum detection confidence.
+        device: ``"cuda"`` or ``"cpu"``.
+    """
+
+    def __init__(
+        self,
+        model_path: str = "yolov8n-pose.pt",
+        conf: float = 0.5,
+        device: str = "cpu",
+    ):
+        from ultralytics import YOLO
+
+        self.model = YOLO(model_path)
+        self.model.to(device)
+        self.conf = conf
+        self.device = device
+
+    def detect(self, frame: np.ndarray) -> List[PersonDetection]:
+        """Run pose detection on a single frame.
+
+        Returns:
+            List of :class:`PersonDetection` with chest points.
+        """
+        results = self.model(frame, conf=self.conf, device=self.device, verbose=False)
+        detections: List[PersonDetection] = []
+        for r in results:
+            if r.boxes is None:
+                continue
+            boxes = r.boxes.xyxy.cpu().numpy().astype(int)
+            confs = r.boxes.conf.cpu().numpy()
+            kps_all = r.keypoints.data.cpu().numpy() if r.keypoints is not None else None
+
+            for i, (box, conf_val) in enumerate(zip(boxes, confs)):
+                x1, y1, x2, y2 = box
+                kps = kps_all[i] if kps_all is not None else None
+                chest = self._chest_point(kps, (x1, y1, x2, y2))
+                detections.append(
+                    PersonDetection(
+                        bbox=(int(x1), int(y1), int(x2), int(y2)),
+                        confidence=float(conf_val),
+                        chest_point=chest,
+                        keypoints=kps,
+                    )
+                )
+        return detections
+
+    @staticmethod
+    def _chest_point(
+        keypoints: Optional[np.ndarray],
+        bbox: Tuple[int, int, int, int],
+    ) -> Tuple[float, float]:
+        """Compute chest point from keypoints with fallback to bbox center.
+
+        Args:
+            keypoints: (17, 3) array where columns are (x, y, conf), or None.
+            bbox: (x1, y1, x2, y2) bounding box.
+
+        Returns:
+            (cx, cy) chest point in pixel coordinates.
+        """
+        if keypoints is not None and keypoints.shape[0] >= max(_TORSO_INDICES) + 1:
+            visible = []
+            for idx in _TORSO_INDICES:
+                if keypoints[idx, 2] >= _KP_CONF_THRESHOLD:
+                    visible.append(keypoints[idx, :2])
+            if len(visible) >= 2:
+                pts = np.array(visible)
+                return (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+
+        # Fallback: bbox centroid
+        x1, y1, x2, y2 = bbox
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -259,12 +393,147 @@ class CrossingDetector:
 
 
 # ---------------------------------------------------------------------------
-# BackgroundSubtractorManager
+# PersistentPersonBibAssociator
+# ---------------------------------------------------------------------------
+
+
+class PersistentPersonBibAssociator:
+    """Accumulates person→bib mapping over time via majority voting.
+
+    Each frame, spatial matching links person bboxes to bib bboxes.  For each
+    matched bib, the OCR consensus number is looked up and a vote is cast.
+    ``get_bib(pid)`` returns the bib number with the most votes.
+
+    Args:
+        max_distance: Max pixel distance for bib-center-to-person-bbox fallback.
+        memory_frames: Frames of inactivity before a person entry is cleaned up.
+    """
+
+    def __init__(self, max_distance: float = 150.0, memory_frames: int = 120):
+        self.max_distance = max_distance
+        self.memory_frames = memory_frames
+        # person_track_id → {bib_number → vote_count}
+        self._votes: Dict[int, Dict[str, int]] = {}
+        # person_track_id → last_frame_seen
+        self._last_seen: Dict[int, int] = {}
+
+    def update(
+        self,
+        person_tracked: Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]],
+        bib_tracked: Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]],
+        final_consensus: Dict[int, Tuple[str, float, str]],
+        frame_idx: int,
+    ) -> None:
+        """Run one frame of association and voting.
+
+        Args:
+            person_tracked: {pid: (centroid, bbox)} from person CentroidTracker.
+            bib_tracked: {bid: (centroid, bbox)} from bib CentroidTracker.
+            final_consensus: {bid: (number, conf, level)} from OCR voting.
+            frame_idx: Current frame number.
+        """
+        for pid, (p_centroid, p_bbox) in person_tracked.items():
+            self._last_seen[pid] = frame_idx
+            px1, py1, px2, py2 = p_bbox
+            best_bid: Optional[int] = None
+            best_dist = float("inf")
+
+            for bid, (b_centroid, b_bbox) in bib_tracked.items():
+                bcx, bcy = b_centroid
+                inside = px1 <= bcx <= px2 and py1 <= bcy <= py2
+                dist = np.sqrt(
+                    (p_centroid[0] - bcx) ** 2 + (p_centroid[1] - bcy) ** 2
+                )
+                if inside:
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_bid = bid
+                elif best_bid is None and dist < self.max_distance and dist < best_dist:
+                    best_dist = dist
+                    best_bid = bid
+
+            if best_bid is not None and best_bid in final_consensus:
+                bib_number, conf, level = final_consensus[best_bid]
+                if level in ("high", "medium"):
+                    if pid not in self._votes:
+                        self._votes[pid] = {}
+                    self._votes[pid][bib_number] = self._votes[pid].get(bib_number, 0) + 1
+
+    def get_bib(self, person_track_id: int) -> Optional[str]:
+        """Return the majority-voted bib number for *person_track_id*, or None."""
+        votes = self._votes.get(person_track_id)
+        if not votes:
+            return None
+        return max(votes, key=votes.get)
+
+    def get_bib_confidence(self, person_track_id: int) -> float:
+        """Return the vote fraction for the winning bib (0.0-1.0)."""
+        votes = self._votes.get(person_track_id)
+        if not votes:
+            return 0.0
+        total = sum(votes.values())
+        best = max(votes.values())
+        return best / total if total > 0 else 0.0
+
+    def cleanup(self, frame_idx: int) -> None:
+        """Remove entries not seen for *memory_frames*."""
+        stale = [
+            pid
+            for pid, last in self._last_seen.items()
+            if frame_idx - last > self.memory_frames
+        ]
+        for pid in stale:
+            self._votes.pop(pid, None)
+            self._last_seen.pop(pid, None)
+
+
+# ---------------------------------------------------------------------------
+# BibCrossingDeduplicator
+# ---------------------------------------------------------------------------
+
+
+class BibCrossingDeduplicator:
+    """Suppresses duplicate crossing events for the same bib number.
+
+    A bib that has already crossed within *debounce_frames* is suppressed.
+    ``"UNKNOWN"`` bibs always pass (cannot deduplicate unknowns).
+
+    Args:
+        debounce_frames: Minimum frames between crossings for the same bib.
+    """
+
+    def __init__(self, debounce_frames: int = 300):
+        # bib_number → last frame it was reported
+        self._recently_crossed: Dict[str, int] = {}
+        self.debounce_frames = debounce_frames
+
+    def should_emit(self, bib_number: str, frame_idx: int) -> bool:
+        """Return True if this crossing should be emitted (not a duplicate).
+
+        Args:
+            bib_number: The bib number string (or ``"UNKNOWN"``).
+            frame_idx: Current frame number.
+        """
+        if bib_number == "UNKNOWN":
+            return True
+        last = self._recently_crossed.get(bib_number)
+        if last is not None and frame_idx - last < self.debounce_frames:
+            return False
+        self._recently_crossed[bib_number] = frame_idx
+        return True
+
+
+# ---------------------------------------------------------------------------
+# BackgroundSubtractorManager (deprecated)
 # ---------------------------------------------------------------------------
 
 
 class BackgroundSubtractorManager:
     """Wraps MOG2 background subtraction + morphological cleanup.
+
+    .. deprecated::
+        Use :class:`PoseDetector` for person detection instead.  MOG2 produces
+        noisy results with merged blobs.
 
     Extracts person-sized blobs filtered by area and aspect ratio.
 
@@ -290,6 +559,11 @@ class BackgroundSubtractorManager:
         max_aspect_ratio: float = 5.0,
         morph_kernel_size: int = 5,
     ):
+        warnings.warn(
+            "BackgroundSubtractorManager is deprecated. Use PoseDetector instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=history,
             varThreshold=var_threshold,
@@ -344,12 +618,16 @@ class BackgroundSubtractorManager:
 
 
 # ---------------------------------------------------------------------------
-# PersonBibAssociator
+# PersonBibAssociator (deprecated)
 # ---------------------------------------------------------------------------
 
 
 class PersonBibAssociator:
     """Matches person blobs to bib detections by spatial proximity.
+
+    .. deprecated::
+        Use :class:`PersistentPersonBibAssociator` for persistent association
+        with temporal voting.
 
     A bib is associated with a person if the bib center falls inside the
     person bounding box, or if it is the closest person within a distance
@@ -361,6 +639,11 @@ class PersonBibAssociator:
     """
 
     def __init__(self, max_distance: float = 150.0):
+        warnings.warn(
+            "PersonBibAssociator is deprecated. Use PersistentPersonBibAssociator instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.max_distance = max_distance
 
     def associate(
@@ -414,12 +697,16 @@ class PersonBibAssociator:
 
 
 # ---------------------------------------------------------------------------
-# MergedBlobEstimator
+# MergedBlobEstimator (deprecated)
 # ---------------------------------------------------------------------------
 
 
 class MergedBlobEstimator:
     """Estimates the number of persons in a merged (large) blob.
+
+    .. deprecated::
+        Use :class:`PoseDetector` which detects individual persons without
+        merging.
 
     Uses a simple area heuristic: estimated_count = blob_area / typical_person_area.
 
@@ -430,6 +717,11 @@ class MergedBlobEstimator:
     """
 
     def __init__(self, typical_person_area: float = 10000.0):
+        warnings.warn(
+            "MergedBlobEstimator is deprecated. Use PoseDetector instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.typical_person_area = typical_person_area
 
     def estimate(self, bbox: Tuple[int, int, int, int]) -> int:
@@ -460,6 +752,8 @@ class CrossingEvent:
     confidence: float  # 0.0-1.0 (0 for UNKNOWN)
     estimated_count: int = 1  # >1 if merged blob
     person_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    chest_point: Optional[Tuple[float, float]] = None  # (cx, cy) pixel coords
+    source: str = "pose"  # "pose", "bib_tracker", or "mog2"
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +780,9 @@ class CrossingEventLog:
         "person_y1",
         "person_x2",
         "person_y2",
+        "chest_x",
+        "chest_y",
+        "source",
     ]
 
     def __init__(self, path: Path):
@@ -495,6 +792,8 @@ class CrossingEventLog:
 
     def write(self, event: CrossingEvent):
         """Write a single crossing event row."""
+        chest_x = f"{event.chest_point[0]:.1f}" if event.chest_point else ""
+        chest_y = f"{event.chest_point[1]:.1f}" if event.chest_point else ""
         self._writer.writerow(
             [
                 event.sequence,
@@ -508,6 +807,9 @@ class CrossingEventLog:
                 event.person_bbox[1],
                 event.person_bbox[2],
                 event.person_bbox[3],
+                chest_x,
+                chest_y,
+                event.source,
             ]
         )
 
