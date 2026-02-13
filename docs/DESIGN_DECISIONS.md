@@ -546,6 +546,42 @@ crops now available, fine-tuning a specialized model is feasible and likely to e
 
 ---
 
+### DD-019: YOLOv8n-Pose for Person Detection (Replacing MOG2)
+
+**Decision**: Use YOLOv8n-pose for person detection and timing-line crossing detection, replacing MOG2 background subtraction
+
+**Context**: MOG2 blob-based person detection tested on REC-0011 produced noisy results (1,199 crossings vs ~800-900 actual finishers). Over 50% were merged blobs — MOG2 cannot distinguish two runners side-by-side from one large blob. Additionally, blob centroids don't correspond to any anatomical landmark, making crossing timing imprecise.
+
+**Alternatives Considered**:
+1. MOG2 background subtraction (baseline) - Simple, zero GPU cost, but noisy and inaccurate
+2. YOLOv8n (standard object detection) - Detects persons but no keypoints for precise crossing
+3. YOLOv8n-pose (pose estimation) - Detects persons with skeleton keypoints, ~25-33ms on Jetson
+4. MediaPipe Pose - Good keypoints but poor multi-person support
+
+**Rationale**:
+- Pose model provides skeleton keypoints (shoulders, hips) to compute chest point
+- Chest point crossing is the official rule for finish-line timing
+- Individual person bounding boxes eliminate merged-blob problem entirely
+- ~25MB GPU memory — fits alongside bib detector on Jetson's 8GB
+- Total pipeline ~40-60ms/frame (16-25fps) — sufficient for crossing detection
+
+**Architecture**:
+- Separate identity (bib OCR) from timing (chest crosses line)
+- `PersistentPersonBibAssociator` links person tracks to bib numbers via voting
+- `BibCrossingDeduplicator` prevents same bib from being reported twice
+- Fallback: `--no-person-detect` uses bib tracker centroids for crossings
+
+**Consequences**:
+- Adds YOLOv8n-pose model download (~6MB weights, auto-downloaded by ultralytics)
+- GPU is now shared between bib detector and pose model (sequential per frame)
+- Frame rate drops from ~30fps (bib-only) to ~16-25fps (bib + pose)
+- MOG2 classes deprecated but kept for backward compatibility
+
+**Status**: Accepted
+**Date**: 2026-02-13
+
+---
+
 ## Pending Decisions
 
 ### DD-P01: Multi-Camera Coordination (Future)

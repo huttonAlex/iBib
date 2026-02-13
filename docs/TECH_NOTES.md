@@ -179,7 +179,70 @@ on the 10,853 verified bib crop dataset, targeting 90%+ accuracy (up from 52.7% 
 
 ### Milestone 1.3: Timing Line Detection
 
-*Awaiting first entries*
+### Entry 2026-02-13: YOLOv8n-Pose Crossing Detection + Bib-Time Association
+
+**Phase/Milestone**: 1.3 - Timing Line Detection
+
+**Objective**:
+Replace MOG2 background subtraction with real person detection for timing-line
+crossing, and implement persistent bib-person association so bibs detected in
+earlier frames follow the person to the crossing moment.
+
+**Background**:
+MOG2 blob detection on REC-0011 produced 1,199 crossings vs ~800-900 actual
+finishers.  Over 50% were merged blobs — two runners side-by-side appeared as
+one large contour.  Blob centroids also had no anatomical correspondence,
+making the "crossing moment" imprecise.
+
+**Method**:
+- Added `PoseDetector` wrapping YOLOv8n-pose (6MB weights, auto-downloaded)
+- Chest point = average of visible torso keypoints (COCO: left\_shoulder=5,
+  right\_shoulder=6, left\_hip=11, right\_hip=12). Fallback: bbox centroid
+- `CentroidTracker.update()` extended with optional `centroids` param so person
+  tracker matches on chest points instead of bbox centers
+- `PersistentPersonBibAssociator` accumulates person→bib votes over time:
+  each frame spatially matches person bboxes to bib bboxes, looks up OCR
+  consensus, casts a vote.  `get_bib(pid)` returns the majority winner.
+- `BibCrossingDeduplicator` suppresses same-bib duplicates within 10s window
+  (UNKNOWN always passes)
+- `CrossingEvent` gains `chest_point` and `source` fields; CSV log updated
+
+**Architecture**:
+```
+Frame → YOLO bib detector (GPU) → bib tracks + OCR → final_consensus
+Frame → YOLOv8n-pose (GPU)     → person tracks (chest keypoint)
+               ↓
+   PersistentPersonBibAssociator: person_track → bib_number (voted)
+               ↓
+   CrossingDetector: chest keypoint crosses timing line
+               ↓
+   BibCrossingDeduplicator: suppress same-bib duplicates
+               ↓
+   Emit CrossingEvent(bib_number, timestamp, confidence)
+```
+
+**Expected Performance** (Jetson Orin Nano):
+
+| Operation | Cost | Type |
+|-----------|------|------|
+| YOLO bib detection | ~8-12ms | GPU |
+| OCR per crop | ~5-15ms | GPU/CPU |
+| YOLOv8n-pose | ~25-33ms | GPU |
+| Association + crossing | <1ms | CPU |
+| **Total** | **~40-60ms (16-25fps)** | |
+
+**Test Coverage**:
+- 41 tests (17 new): PoseDetector chest computation (5), PersistentPersonBibAssociator
+  voting/cleanup (5), BibCrossingDeduplicator (5), CentroidTracker custom centroids (2)
+- Deprecated classes (BackgroundSubtractorManager, PersonBibAssociator, MergedBlobEstimator)
+  emit DeprecationWarning — verified by tests
+
+**Implications for Project**:
+- Ready for validation on Jetson with REC-0011 video
+- Expected significantly fewer false crossings (no merged blobs)
+- Expected more bib-identified crossings (persistent association vs single-frame)
+- Bib-level dedup should eliminate all duplicate bib entries in output CSV
+- GPU shared between two YOLO models — monitor memory on Jetson (~25MB total)
 
 ---
 
@@ -300,3 +363,4 @@ Track performance measurements across phases:
 | E005 | 2026-02-04 | 1.1 | Tagged photo processing | 9,288 verified crops | 3 events via scoring provider |
 | E006 | 2026-02-04 | 1.1 | Combined dataset | 10,853 total verified | 4 events, 6 cameras, 1-4 digit bibs |
 | E007 | 2026-02-04 | 1.2 | Phase 2.1 pipeline setup | Tooling complete | 4 scripts, 3 candidate models |
+| E008 | 2026-02-13 | 1.3 | YOLOv8n-pose crossing detection | Implementation complete | Replaces MOG2, 41 tests passing |
