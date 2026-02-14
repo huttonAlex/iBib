@@ -66,7 +66,8 @@ from pointcam.crossing import (
 class PARSeqOCR:
     """PARSeq OCR from fine-tuned checkpoint."""
 
-    def __init__(self, checkpoint_path: str):
+    def __init__(self, checkpoint_path: str, device: str = "cpu"):
+        self.device = device
         self.model = torch.hub.load(
             "baudm/parseq", "parseq", pretrained=True, trust_repo=True
         )
@@ -75,7 +76,7 @@ class PARSeqOCR:
             self.model.load_state_dict(state["model_state_dict"])
         else:
             self.model.load_state_dict(state)
-        self.model.eval()
+        self.model.eval().to(device)
 
         self.transform = self._make_transform
 
@@ -90,7 +91,7 @@ class PARSeqOCR:
         """Predict bib number from BGR crop."""
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
-        tensor = self.transform(pil_img).unsqueeze(0)
+        tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             logits = self.model(tensor)
@@ -108,6 +109,39 @@ class PARSeqOCR:
 
         digits = "".join(c for c in text if c.isdigit())
         return digits, confidence
+
+    def predict_batch(self, crops_bgr: List[np.ndarray]) -> List[Tuple[str, float]]:
+        """Predict bib numbers from a batch of BGR crops in a single forward pass."""
+        if not crops_bgr:
+            return []
+
+        tensors = []
+        for crop in crops_bgr:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            tensors.append(self.transform(pil_img))
+
+        batch = torch.stack(tensors).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(batch)
+            probs = logits.softmax(-1)
+            preds, probs_out = self.model.tokenizer.decode(probs)
+
+        results = []
+        for i in range(len(crops_bgr)):
+            text = preds[i]
+            p = probs_out[i]
+            if p.numel() == 0:
+                confidence = 0.5
+            elif p.dim() == 1:
+                confidence = p.cumprod(-1)[-1].item()
+            else:
+                confidence = p.cumprod(-1)[:, -1].item()
+            digits = "".join(c for c in text if c.isdigit())
+            results.append((digits, confidence))
+
+        return results
 
 
 class CRNNOCR:
@@ -180,6 +214,7 @@ def process_video(
     debounce_time: float = 2.0,
     enable_person_detect: bool = True,
     pose_model_path: str = "yolov8n-pose.pt",
+    stride: int = 1,
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -293,8 +328,10 @@ def process_video(
     partial_rejected = 0
     cleanup_modified = 0
 
-    # Track final consensus per track
+    # Track final consensus per track (pruned each frame to active tracks only)
     final_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
+    # All-time best consensus per track for summary stats (never pruned)
+    all_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
 
     # --- Person detection + crossing detection (optional) ---
     timing_line = None
@@ -351,6 +388,8 @@ def process_video(
         crossing_log_path = output_dir / f"{Path(video_path).stem}_crossings.csv"
         crossing_log = CrossingEventLog(crossing_log_path)
 
+    if stride > 1:
+        print(f"Frame stride: {stride} (processing every {stride}th frame)")
     print("\nProcessing...")
 
     while True:
@@ -360,6 +399,10 @@ def process_video(
 
         frame_idx += 1
         time_sec = frame_idx / fps
+
+        # Skip frames based on stride (still count for correct timestamps)
+        if stride > 1 and frame_idx % stride != 0:
+            continue
 
         # Detect bibs
         t0 = time.perf_counter()
@@ -382,7 +425,8 @@ def process_video(
         # Update tracker
         tracked = tracker.update(detections)
 
-        # Process each tracked detection
+        # Phase 1: Collect crops and metadata for batch OCR
+        ocr_batch_items = []  # (track_id, bbox, det_conf, crop)
         for track_id, (centroid, bbox) in tracked.items():
             x1, y1, x2, y2 = bbox
 
@@ -431,11 +475,28 @@ def process_video(
                         quality_rejected += 1
                     continue  # Skip OCR for low-quality crops
 
-            # OCR
+            ocr_batch_items.append((track_id, bbox, det_conf, crop))
+
+        # Phase 2: Batch OCR (single GPU forward pass when possible)
+        crops = [item[3] for item in ocr_batch_items]
+        if crops and hasattr(ocr_model, "predict_batch"):
             t2 = time.perf_counter()
-            ocr_raw, ocr_conf = ocr_model.predict(crop)
+            ocr_results = ocr_model.predict_batch(crops)
             t3 = time.perf_counter()
             total_ocr_time += t3 - t2
+        else:
+            ocr_results = []
+            for item in ocr_batch_items:
+                t2 = time.perf_counter()
+                result = ocr_model.predict(item[3])
+                t3 = time.perf_counter()
+                total_ocr_time += t3 - t2
+                ocr_results.append(result)
+
+        # Phase 3: Process OCR results
+        for idx, (track_id, bbox, det_conf, crop) in enumerate(ocr_batch_items):
+            x1, y1, x2, y2 = bbox
+            ocr_raw, ocr_conf = ocr_results[idx]
             total_detections += 1
 
             if not ocr_raw:
@@ -485,6 +546,7 @@ def process_video(
                 classified.adjusted_confidence,
                 classified.level.value,
             )
+            all_consensus[track_id] = final_consensus[track_id]
 
             # Add to review queue if needed
             if classified.needs_review:
@@ -516,48 +578,49 @@ def process_video(
             )
 
             # Draw on frame with color based on confidence level
-            if classified.level == ConfidenceLevel.HIGH:
-                color = (0, 255, 0)  # Green
-            elif classified.level == ConfidenceLevel.MEDIUM:
-                color = (0, 255, 255)  # Yellow
-            elif classified.level == ConfidenceLevel.LOW:
-                color = (0, 165, 255)  # Orange
-            else:
-                color = (0, 0, 255)  # Red
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Label with consensus and validation status
-            status = ""
-            if bib_validator:
-                if is_valid:
-                    status = " [OK]"
-                elif validation_result and validation_result.is_corrected:
-                    status = f" [{ocr_raw}->{validated_number}]"
+            if write_video or show:
+                if classified.level == ConfidenceLevel.HIGH:
+                    color = (0, 255, 0)  # Green
+                elif classified.level == ConfidenceLevel.MEDIUM:
+                    color = (0, 255, 255)  # Yellow
+                elif classified.level == ConfidenceLevel.LOW:
+                    color = (0, 165, 255)  # Orange
                 else:
-                    status = " [?]"
+                    color = (0, 0, 255)  # Red
 
-            if consensus_result.is_stable:
-                status += " *"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-            label = f"#{track_id}: {consensus_number} ({classified.adjusted_confidence:.2f}){status}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(
-                frame,
-                (x1, y1 - label_size[1] - 10),
-                (x1 + label_size[0] + 4, y1),
-                color,
-                -1,
-            )
-            cv2.putText(
-                frame,
-                label,
-                (x1 + 2, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 0, 0),
-                2,
-            )
+                # Label with consensus and validation status
+                status = ""
+                if bib_validator:
+                    if is_valid:
+                        status = " [OK]"
+                    elif validation_result and validation_result.is_corrected:
+                        status = f" [{ocr_raw}->{validated_number}]"
+                    else:
+                        status = " [?]"
+
+                if consensus_result.is_stable:
+                    status += " *"
+
+                label = f"#{track_id}: {consensus_number} ({classified.adjusted_confidence:.2f}){status}"
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(
+                    frame,
+                    (x1, y1 - label_size[1] - 10),
+                    (x1 + label_size[0] + 4, y1),
+                    color,
+                    -1,
+                )
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1 + 2, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 0),
+                    2,
+                )
 
         # --- Person detection + crossing detection ---
         if pose_detector is not None:
@@ -624,11 +687,12 @@ def process_video(
             person_bib_assoc.cleanup(frame_idx)
 
             # Draw person bboxes (cyan) + chest points (magenta dots)
-            for pid, (p_centroid, p_bbox) in person_tracked.items():
-                px1, py1, px2, py2 = p_bbox
-                cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 255, 0), 1)
-                cx, cy = int(p_centroid[0]), int(p_centroid[1])
-                cv2.circle(frame, (cx, cy), 5, (255, 0, 255), -1)
+            if write_video or show:
+                for pid, (p_centroid, p_bbox) in person_tracked.items():
+                    px1, py1, px2, py2 = p_bbox
+                    cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 255, 0), 1)
+                    cx, cy = int(p_centroid[0]), int(p_centroid[1])
+                    cv2.circle(frame, (cx, cy), 5, (255, 0, 255), -1)
 
         elif crossing_detector is not None:
             # No person detection — use bib tracker for crossings instead
@@ -666,9 +730,18 @@ def process_video(
             crossing_detector.cleanup(set(tracked.keys()))
 
         # Draw timing line (magenta)
-        if timing_line is not None:
+        if timing_line is not None and (write_video or show):
             pt1, pt2 = timing_line.to_pixel_coords(width, height)
             cv2.line(frame, pt1, pt2, (255, 0, 255), 2)
+
+        # Prune dead tracks from voting/consensus to prevent memory leak
+        active_track_ids = set(tracked.keys())
+        stale_voting_ids = set(voting.history.keys()) - active_track_ids
+        for dead_id in stale_voting_ids:
+            voting.clear_track(dead_id)
+        stale_consensus_ids = set(final_consensus.keys()) - active_track_ids
+        for dead_id in stale_consensus_ids:
+            del final_consensus[dead_id]
 
         # Write frame
         if out_writer:
@@ -723,7 +796,7 @@ def process_video(
     # Count by confidence level
     level_counts = {"high": 0, "medium": 0, "low": 0, "reject": 0}
     bib_counts: Dict[str, int] = {}
-    for track_id, (number, conf, level) in final_consensus.items():
+    for track_id, (number, conf, level) in all_consensus.items():
         level_counts[level] += 1
         if level in ("high", "medium"):
             bib_counts[number] = bib_counts.get(number, 0) + 1
@@ -863,6 +936,12 @@ def main():
         default="yolov8n-pose.pt",
         help="Path to YOLOv8-pose weights (default: yolov8n-pose.pt, auto-downloaded)",
     )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Process every Nth frame (default: 1, no skipping)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -915,10 +994,11 @@ def main():
     print()
 
     # Load OCR model
-    print("Loading OCR model...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading OCR model (device={device})...")
     if args.ocr == "parseq":
         parseq_checkpoint = project_root / "runs/ocr_finetune/parseq_gpu_v1/best.pt"
-        ocr_model = PARSeqOCR(str(parseq_checkpoint))
+        ocr_model = PARSeqOCR(str(parseq_checkpoint), device=device)
         print(f"  PARSeq loaded from {parseq_checkpoint}")
     else:
         crnn_onnx = project_root / "models/ocr_crnn.onnx"
@@ -956,6 +1036,7 @@ def main():
         debounce_time=args.debounce_time,
         enable_person_detect=not args.no_person_detect,
         pose_model_path=args.pose_model,
+        stride=args.stride,
     )
 
     print("\nDone!")
