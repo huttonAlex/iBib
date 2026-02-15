@@ -223,7 +223,9 @@ def process_video(
     # Load detector
     device = "cuda" if torch.cuda.is_available() else "cpu"
     detector = YOLO(detector_path)
-    detector.to(device)
+    # .to() only works for PyTorch models; TensorRT/ONNX pass device at predict time
+    if detector_path.endswith(".pt"):
+        detector.to(device)
 
     # Initialize Tier 1 components
     tracker = CentroidTracker(max_disappeared=30, max_distance=100)

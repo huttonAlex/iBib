@@ -206,7 +206,9 @@ class PoseDetector:
         from ultralytics import YOLO
 
         self.model = YOLO(model_path)
-        self.model.to(device)
+        # .to() only works for PyTorch models; TensorRT/ONNX pass device at predict time
+        if model_path.endswith(".pt"):
+            self.model.to(device)
         self.conf = conf
         self.device = device
 
