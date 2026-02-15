@@ -553,6 +553,88 @@ The pipeline successfully processes the full 30-min video without crashing, conf
 - Crossings: `runs/pipeline_test/REC-0006-A_crossings.csv`
 - Detections: `runs/pipeline_test/REC-0006-A_detections.csv`
 
+### Entry 2026-02-15: Real-Time Inference Optimization (TensorRT + OCR Skip)
+
+**Phase/Milestone**: 1.4 - Basic Video Processing
+
+**Objective**:
+Optimize pipeline from ~5 fps (serial PyTorch, single-threaded) toward ~30 fps target for real-time operation on Jetson Orin Nano.
+
+**Background**:
+Run 3 showed ~20 fps overall (36 fps sparse, 11 fps dense) with three serial PyTorch/ONNX models: bib detection (31ms), pose detection (37ms), PARSeq OCR (38ms/batch). TensorRT 10.3.0 is installed on the Jetson. `tegrastats` showed CPU clocks at 729 MHz — far below the ~1.5 GHz max.
+
+**Optimization Phases Implemented**:
+
+**Phase A: TensorRT Model Exports**
+
+| Model | Backend | Export Method | Expected Speedup |
+|-------|---------|---------------|-----------------|
+| YOLOv8n bib detector | ultralytics `.engine` | `YOLO.export(format="engine", half=True)` | 31ms → ~8-10ms |
+| YOLOv8n-pose | ultralytics `.engine` | `YOLO.export(format="engine", half=True)` | 37ms → ~10-12ms |
+| PARSeq OCR | ONNX RT + TensorRT EP | Runtime compilation, cached | 38ms → ~12-15ms |
+| CRNN OCR | `trtexec` → `.engine` | Direct conversion (simple CTC arch) | ~17ms → ~5-8ms |
+
+- YOLOv8 models: trivial — ultralytics auto-detects `.engine` extension, zero code changes to `crossing.py:PoseDetector` or pipeline detector loading
+- PARSeq: autoregressive decoder has dynamic control flow incompatible with static TRT engines. ONNX Runtime TRT EP compiles compatible subgraphs to TensorRT, falls back to CUDA EP for the rest. Engine cache built on first run, reused thereafter.
+- CRNN: simple CNN+RNN+CTC pipeline, direct `trtexec` conversion works
+
+Files:
+- `scripts/export_tensorrt.py` — run on Jetson to build device-specific engines
+- `src/pointcam/inference.py` — `OnnxTensorRTParseqOCR` and `TensorRTCrnnOCR` classes
+- `scripts/test_video_pipeline.py` — `--ocr-backend tensorrt` flag
+
+**Phase B: Conditional OCR Skip for Stable Tracks**
+
+After quality filter, before OCR, check if a track already has a stable high-confidence consensus:
+- `is_stable` requires 5 consecutive identical reads (`EnhancedTemporalVoting`)
+- Consensus confidence >= 0.85
+- Track must already be in `final_consensus` dict
+- If all conditions met, skip OCR for this crop (save ~12-38ms per crop)
+- If track loses stability (different number appears), `is_stable` goes False and OCR resumes
+
+Expected: 30-50% fewer OCR calls in dense sections where 3-8 bibs are visible and 40-60% are already stable.
+
+Flags: `--no-ocr-skip` disables for benchmarking/regression testing.
+
+**Phase C: System Tuning**
+
+`sudo jetson_clocks` — locks CPU/GPU/EMC to max frequencies. Must run after every boot.
+```bash
+# One-time (per boot):
+sudo jetson_clocks
+
+# Verify with:
+sudo jetson_clocks --show
+# CPU should show ~1.5GHz (was 729MHz), GPU should show max freq
+
+# To make persistent across reboots:
+sudo systemctl enable jetson_clocks
+```
+
+Frame stride (`--stride 2`) already implemented. At 30fps source, processes 15fps input. With hysteresis_frames=3, a crossing needs 3 processed frames on new side = 6 real frames (200ms) — well within ±1s timing tolerance.
+
+Drawing already gated by `if write_video or show:` — `--no-video` without `--show` skips all annotation.
+
+**Expected Combined Performance**:
+
+| Configuration | Est. FPS | Limiting Factor |
+|--------------|----------|----------------|
+| Baseline (PyTorch, stride 1) | ~5 fps | Serial GPU inference |
+| + TensorRT (all models) | ~12-15 fps | GPU total ~30-37ms |
+| + OCR skip (stable tracks) | ~15-20 fps | Fewer OCR calls in dense |
+| + stride 2 | ~25-33 fps | Half the frames to process |
+| + jetson_clocks | ~28-36 fps | CPU overhead reduced |
+
+**Verification Plan**:
+1. Export on Jetson: `python scripts/export_tensorrt.py`
+2. Accuracy parity: compare crossing CSVs between PyTorch and TensorRT on same clip
+3. Performance: compare fps with `--start-time 460` on REC-0006-A.mp4
+4. OCR skip regression: compare `--no-ocr-skip` vs default, verify identical crossings
+5. End-to-end: full run with all optimizations vs ground truth `bib_order.txt`
+
+**Deferred — Phase D: Threaded Pipeline**:
+On a single GPU, neural network inference is inherently serial (shared CUDA stream). Threading benefit is limited to overlapping I/O with GPU work. Only worth implementing if Phases A-C don't reach ~25-30 fps target.
+
 ---
 
 ## Phase 2: Real-World Testing
@@ -673,3 +755,4 @@ Track performance measurements across phases:
 | E012 | 2026-02-14 | 1.3 | False positive source analysis | Jersey numbers high risk, clocks medium | Bib set validation is strongest defense |
 | E013 | 2026-02-14 | 1.4 | Pipeline perf fixes (batch OCR, pruning) | Full video, no crash, 36fps sparse | Dead track pruning fixes OOM crash |
 | E014 | 2026-02-14 | 1.4 | Giants 5K ground truth comparison | 7.7% bib recall, 44% precision | Crossing detection is the bottleneck, not OCR |
+| E015 | 2026-02-15 | 1.4 | TensorRT optimization implementation | Pending Jetson validation | TRT export, OCR skip, jetson_clocks |

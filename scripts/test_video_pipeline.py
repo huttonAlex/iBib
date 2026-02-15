@@ -216,6 +216,7 @@ def process_video(
     pose_model_path: str = "yolov8n-pose.pt",
     stride: int = 1,
     start_time: float = 0.0,
+    enable_ocr_skip: bool = True,
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -328,6 +329,7 @@ def process_video(
     edge_rejected = 0
     partial_rejected = 0
     cleanup_modified = 0
+    ocr_skip_count = 0
 
     # Track final consensus per track (pruned each frame to active tracks only)
     final_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
@@ -481,6 +483,17 @@ def process_video(
                     else:
                         quality_rejected += 1
                     continue  # Skip OCR for low-quality crops
+
+            # Phase B: Skip OCR for tracks with stable high-confidence consensus
+            if enable_ocr_skip:
+                consensus = voting.get_consensus(track_id)
+                if (
+                    consensus.is_stable
+                    and consensus.confidence >= 0.85
+                    and track_id in final_consensus
+                ):
+                    ocr_skip_count += 1
+                    continue  # Existing consensus is good; save OCR compute
 
             ocr_batch_items.append((track_id, bbox, det_conf, crop))
 
@@ -811,7 +824,8 @@ def process_video(
     print(f"  Edge-rejected (partial at frame edge): {edge_rejected}")
     print(f"  Partial/obstructed rejected: {partial_rejected}")
     print(f"  Quality-rejected (blur/size/etc): {quality_rejected}")
-    print(f"  Total OCR calls saved: {edge_rejected + partial_rejected + quality_rejected}")
+    print(f"  Total OCR calls saved: {edge_rejected + partial_rejected + quality_rejected + ocr_skip_count}")
+    print(f"  OCR stable-track skips: {ocr_skip_count}")
     print(f"  OCR cleanups applied: {cleanup_modified}")
 
     # Count by confidence level
@@ -969,6 +983,19 @@ def main():
         default=0.0,
         help="Skip to this time in seconds before processing (default: 0.0)",
     )
+    parser.add_argument(
+        "--ocr-backend",
+        type=str,
+        default="pytorch",
+        choices=["pytorch", "tensorrt"],
+        help="OCR inference backend (default: pytorch). "
+             "'tensorrt' uses ONNX Runtime + TensorRT EP for GPU acceleration.",
+    )
+    parser.add_argument(
+        "--no-ocr-skip",
+        action="store_true",
+        help="Disable OCR skip optimization for stable tracks (always run OCR)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -992,8 +1019,9 @@ def main():
     print("=" * 70)
     print(f"Video:    {video_path}")
     print(f"Detector: {detector_path}")
-    print(f"OCR:      {args.ocr}")
+    print(f"OCR:      {args.ocr} (backend: {args.ocr_backend})")
     print(f"Placement: {args.placement}")
+    print(f"OCR skip: {'disabled' if args.no_ocr_skip else 'enabled'}")
     print(f"Output:   {output_dir}")
 
     # Load bib validator if specified
@@ -1022,15 +1050,27 @@ def main():
 
     # Load OCR model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading OCR model (device={device})...")
-    if args.ocr == "parseq":
-        parseq_checkpoint = project_root / "runs/ocr_finetune/parseq_gpu_v1/best.pt"
-        ocr_model = PARSeqOCR(str(parseq_checkpoint), device=device)
-        print(f"  PARSeq loaded from {parseq_checkpoint}")
+    print(f"Loading OCR model (device={device}, backend={args.ocr_backend})...")
+    if args.ocr_backend == "tensorrt":
+        from pointcam.inference import OnnxTensorRTParseqOCR, TensorRTCrnnOCR
+
+        if args.ocr == "parseq":
+            parseq_onnx = project_root / "models/ocr_parseq.onnx"
+            ocr_model = OnnxTensorRTParseqOCR(str(parseq_onnx))
+            print(f"  PARSeq TensorRT loaded from {parseq_onnx}")
+        else:
+            crnn_onnx = project_root / "models/ocr_crnn.onnx"
+            ocr_model = TensorRTCrnnOCR(str(crnn_onnx))
+            print(f"  CRNN TensorRT loaded from {crnn_onnx}")
     else:
-        crnn_onnx = project_root / "models/ocr_crnn.onnx"
-        ocr_model = CRNNOCR(str(crnn_onnx))
-        print(f"  CRNN loaded from {crnn_onnx}")
+        if args.ocr == "parseq":
+            parseq_checkpoint = project_root / "runs/ocr_finetune/parseq_gpu_v1/best.pt"
+            ocr_model = PARSeqOCR(str(parseq_checkpoint), device=device)
+            print(f"  PARSeq loaded from {parseq_checkpoint}")
+        else:
+            crnn_onnx = project_root / "models/ocr_crnn.onnx"
+            ocr_model = CRNNOCR(str(crnn_onnx))
+            print(f"  CRNN loaded from {crnn_onnx}")
 
     # Parse timing line
     timing_line_coords = None
@@ -1065,6 +1105,7 @@ def main():
         pose_model_path=args.pose_model,
         stride=args.stride,
         start_time=args.start_time,
+        enable_ocr_skip=not args.no_ocr_skip,
     )
 
     print("\nDone!")
