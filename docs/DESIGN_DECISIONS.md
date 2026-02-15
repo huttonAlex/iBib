@@ -582,6 +582,161 @@ crops now available, fine-tuning a specialized model is feasible and likely to e
 
 ---
 
+### DD-020: Network Architecture - Join Operator's Hotspot
+
+**Decision**: Jetson joins the operator's existing cellular hotspot rather than creating its own network or requiring a dedicated switch
+
+**Context**: Need to determine how the operator accesses the PointCam web UI during races. Race timers typically use a cellular hotspot for internet access (scoring software is cloud-based, RFID readers connect via 4G to ChronoTrack servers). There is no local network switch at the finish line. The operator's laptop WiFi is already connected to the hotspot for scoring — they cannot switch to a separate PointCam network.
+
+**Alternatives Considered**:
+1. Jetson creates its own WiFi AP — operator must disconnect from hotspot to access UI, breaking scoring software connectivity
+2. Dedicated network switch at finish line — adds hardware, changes operator workflow, most timers don't use one
+3. Remote server — Jetson sends data to cloud server for UI. Adds latency, network dependency, more load (encoding + uploading), and a failure point
+4. Jetson joins operator's existing hotspot — both devices on same network, no workflow change
+
+**Rationale**:
+- Zero change to operator's existing workflow (hotspot already running)
+- Laptop accesses PointCam UI via browser tab on the same network it's already on
+- Jetson gets internet access for CTP01 delivery to cloud scoring software
+- No additional hardware needed
+- Consistent with DD-001 (on-board processing) — all CV processing stays local, only timing data traverses the network
+- Web server load on Jetson is negligible (~2-3% CPU, ~50MB RAM) compared to CV inference
+
+**Network Topology**:
+```
+[Phone / MiFi Hotspot]
+├── WiFi → Scoring laptop (scoring software + browser → pointcam.local)
+├── WiFi → Jetson (CV pipeline + web UI + CTP01 client)
+└── 4G  → Internet (ChronoTrack, cloud scoring)
+
+[RFID Readers] → 4G → ChronoTrack (independent network)
+```
+
+**Implementation Notes**:
+- mDNS/Avahi for `pointcam.local` hostname resolution
+- Fallback: display IP address on Jetson boot (OLED or serial console)
+- Support DHCP (default) and static IP configuration
+- Watch for hotspot AP isolation (client isolation) — some carriers enable it by default, preventing device-to-device communication on the hotspot
+
+**Consequences**:
+- Depends on hotspot allowing device-to-device traffic (most phone hotspots do)
+- PointCam UI requires same network as operator's device
+- No UI access if hotspot is down (but scoring software is also down in that case)
+- Future option: Jetson can run WiFi AP simultaneously via wlan0 for tablet access during setup, while connected to hotspot via ethernet adapter
+
+**Status**: Accepted
+**Date**: 2026-02-14
+
+---
+
+### DD-021: False Positive Mitigation Strategy
+
+**Decision**: Address false positive bib detections (jersey numbers, finish line clocks, signage) through a layered approach: existing pipeline filters first, static region suppression planned, ROI exclusion zones deferred to UI phase
+
+**Context**: Testing with race videos (e.g., Giants 5K) identified two major false positive sources: (1) sports jersey numbers worn by runners — same chest location as bibs, persistently visible, and reinforced by temporal voting; (2) finish line clock digits — static numeric display in the frame. Additional sources include sponsor banners, course markers, and spectator clothing.
+
+**Existing Defenses** (already implemented):
+- `BibSetValidator` — rejects numbers not in registration list (-0.2 confidence penalty)
+- `SuspiciousPredictionFilter` — short predictions (1-2 digits, typical of jerseys) require ≥0.85 confidence
+- `PersistentPersonBibAssociator` — requires spatial match to a tracked person (helps with static clocks)
+- `CropQualityFilter` — aspect ratio, blur, contrast checks filter non-bib regions
+- `EnhancedTemporalVoting` — noise from single frames gets outvoted
+
+**Planned: Static Region Suppression**:
+- Detections appearing at the same pixel coordinates across many frames without moving are likely signs/clocks
+- Heatmap of detection locations over time, suppress regions with persistent stationary detections
+- No operator configuration needed — fully automatic
+
+**Deferred: ROI Exclusion Zones** (to Phase 3 - UI):
+- Operator draws exclusion masks over known false positive areas (clocks, banners)
+- Operator defines detection zones to restrict where in the frame to look for runners
+- Requires web UI for setup — deferred until Milestone 3.1
+
+**Remaining Gap: Jersey Numbers**:
+- Jerseys are worn on the chest (same as bibs), move with the runner, and are persistent
+- Best long-term defense is the bib detection model itself — trained on paper bibs, it should learn to distinguish from jersey printing
+- Including negative examples (jerseys, signage) in training data would strengthen this
+- Digit count helps (jerseys: 1-2 digits; bibs: typically 3-5) but isn't foolproof
+- Bib set validation is the strongest existing defense for jersey numbers
+
+**Status**: Accepted
+**Date**: 2026-02-14
+
+---
+
+### DD-022: Crossing Detection Overhaul — Hysteresis, Track Dedup, and Association Fixes
+
+**Decision**: Address the five failure modes identified in Giants 5K Run 3 ground truth comparison (7.7% bib recall, 44% precision) through targeted fixes to crossing detection, deduplication, and bib-person association.
+
+**Context**: Running the full 30-min Giants 5K video (480 finishers) against ground truth revealed that crossing detection — not OCR — is the primary bottleneck. 62% of bibs are seen by OCR at some point but only 22% make it to a crossing event. Additionally, persons lingering at the timing line generate repeated false crossings, and UNKNOWN crossings are never deduplicated.
+
+**Problem Breakdown**:
+
+| Failure Mode | Impact | Evidence |
+|---|---|---|
+| Timing line oscillation | 15 tracks cross multiple times (28 extra crossings) | Track 223: 10 crossings over 158s, all at chest_x ≈ 0.52 |
+| UNKNOWN never deduped | 101 UNKNOWN crossings, many from same person | `should_emit()` returns True immediately for UNKNOWN |
+| Bib-person association fails | 40% of detected bibs never link to a crossing | 20/50 GT bibs seen by OCR but no crossing event |
+| Bib detector misses | 38% of GT bibs never detected at all | 19/50 GT bibs absent from detections CSV |
+| OCR misreads as valid bibs | 54 false positive bib numbers | Single-digit fragments (1, 2, 6) are top "detections" |
+
+**Fixes — Priority Order**:
+
+**Fix 1: Crossing hysteresis (High priority)**
+- Current: `CrossingDetector.check()` fires when `prev_side != current_side` — a single frame flip triggers a crossing
+- Problem: chest keypoint jitter at the timing line causes repeated flips
+- Solution: require the track to remain on the new side for N consecutive frames (e.g., 3-5 frames = 100-170ms) before confirming a crossing. This is a standard hysteresis/debounce pattern for noisy signals
+- Implementation: add a `_pending_crossing` dict tracking `{track_id: (new_side, first_frame, consecutive_count)}`; only fire when `consecutive_count >= hysteresis_frames`
+- Expected impact: eliminates track 223's 10 crossings → 1 or 0
+
+**Fix 2: UNKNOWN deduplication by track ID (High priority)**
+- Current: `BibCrossingDeduplicator.should_emit()` returns True immediately for UNKNOWN
+- Problem: same person crosses multiple times with no bib → multiple UNKNOWN events
+- Solution: add per-track debounce for UNKNOWN crossings using `person_track_id`. Maintain a `_track_last_crossing` dict; suppress UNKNOWN if same track crossed within `debounce_frames`
+- Implementation: in `should_emit()`, accept an optional `track_id` parameter; for UNKNOWN, debounce by track_id instead of bib_number
+- Expected impact: reduces 101 UNKNOWN → ~70 (removing multi-crossing duplicates)
+
+**Fix 3: Wider bib-person association radius (Medium priority)**
+- Current: `max_distance=150px` for matching bibs to persons. Bib must be inside person bbox or within 150px
+- Problem: at 1920px width, runners at the timing line may have bibs detected 200-300px from their person bbox center (different YOLO models, different bbox scales)
+- Solution: increase `max_distance` to 200-250px, or scale it relative to person bbox height
+- Also: improve `_find_best_match()` to prefer bibs that overlap the person's torso region (upper half of person bbox) rather than just proximity to bbox center
+- Expected impact: recovers some of the 40% of detected-but-unlinked bibs
+
+**Fix 4: Suppress short OCR fragments at crossing time (Medium priority)**
+- Current: bibs like "1", "2", "6" pass validation because they're in the bib set (1-1678 range)
+- Problem: these are almost always single-digit OCR fragments, not real bibs. Bib "1" has 35 tracks, "6" has 13 — wildly more than any real bib
+- Solution: at crossing emission time, require bibs with fewer digits than the race's typical digit count to have consensus confidence ≥ 0.9 (or require stability). Alternatively, tag short-digit consensus results that were never validated by the bib set's fuzzy matching
+- Implementation: add a `min_crossing_confidence` per digit count (e.g., 1-digit: 0.95, 2-digit: 0.85, 3-digit: 0.60, 4-digit: 0.50)
+- Expected impact: eliminates most of the 54 false positive bib numbers
+
+**Fix 5: Timing line zone instead of line (Low priority, future)**
+- Current: timing line is a 1D line; crossing = side transition
+- Problem: a person must cross exactly that pixel column. If they cross between frames (30fps = 33ms gaps), they may never be seen transitioning
+- Solution: define a timing *zone* (e.g., 50px wide band). Enter-zone + exit-zone = crossing. More forgiving than exact line crossing
+- Expected impact: may recover some of the 57% of finishers not detected crossing
+
+**Alternatives Considered**:
+1. **Increase pose detection confidence threshold**: Would reduce false person tracks but also miss real people. Not recommended — person detection recall is already the bottleneck.
+2. **Use bib tracker for crossings instead of person tracker**: Reverts to the old approach. Problem: bib tracker has worse position accuracy (bib centroid ≠ person position) and bibs may not be visible at crossing moment.
+3. **Add a second timing line for confirmation**: Two lines N pixels apart, require both crossed. Reduces false crossings but also reduces recall. Too aggressive given current 43% recall.
+
+**Implementation Order**:
+1. Fixes 1+2 together (hysteresis + UNKNOWN dedup) — quick code changes, biggest impact
+2. Fix 4 (short fragment suppression) — simple confidence threshold at emission
+3. Fix 3 (wider association) — tune parameters
+4. Fix 5 (timing zone) — requires more design work, defer to next iteration
+
+**Consequences**:
+- Hysteresis adds 3-5 frame latency (~100-170ms) to crossing detection — acceptable given ±1s timing tolerance
+- UNKNOWN dedup by track means some legitimate re-crossings (e.g., relay runners) would be suppressed — acceptable for 5K (no re-crossings)
+- Short fragment suppression may filter legitimate short bibs (e.g., bib "1") if confidence is marginal — acceptable tradeoff given the 54 false positives currently
+
+**Status**: Accepted
+**Date**: 2026-02-14
+
+---
+
 ## Pending Decisions
 
 ### DD-P01: Multi-Camera Coordination (Future)

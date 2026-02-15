@@ -319,13 +319,17 @@ class CrossingDetector:
     """Detects when a tracked object's centroid crosses the timing line.
 
     Tracks the previous side-of-line for each track ID and fires when
-    the side changes (with debounce to prevent double-counting).
+    the side changes.  A crossing is only confirmed after the object
+    stays on the new side for *hysteresis_frames* consecutive checks,
+    suppressing jitter from keypoint noise at the line boundary.
 
     Args:
         timing_line: The :class:`TimingLine` to detect crossings against.
         direction: ``"left_to_right"`` (+1 to -1), ``"right_to_left"``
             (-1 to +1), or ``"any"``.
         debounce_frames: Minimum frames between crossings for the same track.
+        hysteresis_frames: Consecutive frames on the new side required to
+            confirm a crossing.  Set to 1 for legacy (instant) behaviour.
     """
 
     def __init__(
@@ -333,14 +337,18 @@ class CrossingDetector:
         timing_line: TimingLine,
         direction: str = "any",
         debounce_frames: int = 60,
+        hysteresis_frames: int = 3,
     ):
         self.timing_line = timing_line
         self.direction = direction
         self.debounce_frames = debounce_frames
-        # track_id -> last known side (+1 / -1)
+        self.hysteresis_frames = hysteresis_frames
+        # track_id -> last *confirmed* side (+1 / -1)
         self._prev_side: Dict[int, int] = {}
         # track_id -> frame number of last crossing
         self._last_crossing_frame: Dict[int, int] = {}
+        # track_id -> (candidate_side, consecutive_count)
+        self._pending: Dict[int, Tuple[int, int]] = {}
 
     def check(
         self,
@@ -365,22 +373,47 @@ class CrossingDetector:
             return False
 
         prev = self._prev_side.get(track_id)
-        self._prev_side[track_id] = side
 
-        if prev is None or prev == side:
+        # First observation — record side, no crossing
+        if prev is None:
+            self._prev_side[track_id] = side
             return False
 
-        # Debounce
+        # Still on the same confirmed side — clear any pending transition
+        if side == prev:
+            self._pending.pop(track_id, None)
+            return False
+
+        # side != prev — potential transition
+        pending = self._pending.get(track_id)
+        if pending is not None and pending[0] == side:
+            count = pending[1] + 1
+        else:
+            count = 1
+        self._pending[track_id] = (side, count)
+
+        if count < self.hysteresis_frames:
+            return False
+
+        # Confirmed crossing — apply debounce + direction checks
         last_frame = self._last_crossing_frame.get(track_id, -self.debounce_frames - 1)
         if frame_idx - last_frame < self.debounce_frames:
+            # Debounced: still commit the side so we don't re-fire
+            self._prev_side[track_id] = side
+            self._pending.pop(track_id, None)
             return False
 
-        # Direction filter
         if self.direction == "left_to_right" and not (prev == 1 and side == -1):
+            self._prev_side[track_id] = side
+            self._pending.pop(track_id, None)
             return False
         if self.direction == "right_to_left" and not (prev == -1 and side == 1):
+            self._prev_side[track_id] = side
+            self._pending.pop(track_id, None)
             return False
 
+        self._prev_side[track_id] = side
+        self._pending.pop(track_id, None)
         self._last_crossing_frame[track_id] = frame_idx
         return True
 
@@ -390,6 +423,7 @@ class CrossingDetector:
             if tid not in active_track_ids:
                 self._prev_side.pop(tid, None)
                 self._last_crossing_frame.pop(tid, None)
+                self._pending.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -584,12 +618,15 @@ class BibCrossingDeduplicator:
         self._emission_count: Dict[str, int] = {}
         self.debounce_frames = debounce_frames
         self.escalation_thresholds = escalation_thresholds or self.DEFAULT_ESCALATION.copy()
+        # track_id → last frame an UNKNOWN was emitted (for per-track dedup)
+        self._track_last_crossing: Dict[int, int] = {}
 
     def should_emit(
         self,
         bib_number: str,
         frame_idx: int,
         confidence: float = 1.0,
+        track_id: Optional[int] = None,
     ) -> bool:
         """Return True if this crossing should be emitted (not a duplicate).
 
@@ -597,8 +634,15 @@ class BibCrossingDeduplicator:
             bib_number: The bib number string (or ``"UNKNOWN"``).
             frame_idx: Current frame number.
             confidence: Confidence score for this crossing (0.0-1.0).
+            track_id: Person/bib track ID.  When provided, UNKNOWN crossings
+                from the same track within the debounce window are suppressed.
         """
         if bib_number == "UNKNOWN":
+            if track_id is not None:
+                last = self._track_last_crossing.get(track_id)
+                if last is not None and frame_idx - last < self.debounce_frames:
+                    return False
+                self._track_last_crossing[track_id] = frame_idx
             return True
 
         # Frame-based debounce

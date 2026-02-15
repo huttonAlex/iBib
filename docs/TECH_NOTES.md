@@ -361,6 +361,200 @@ Adjusted for duplicates, the old run had ~161 unique identified bibs → new has
 
 ---
 
+### Entry 2026-02-14: False Positive Sources & Maturity Assessment
+
+**Phase/Milestone**: 1.3 - Pipeline Integration
+
+**Objective**:
+Assess false positive risks from non-bib number sources (jersey numbers, finish line clocks) ahead of Giants 5K test video, and document realistic accuracy expectations across project maturity phases.
+
+**False Positive Sources Identified**:
+
+| Source | Risk Level | Existing Defense | Gap |
+|--------|-----------|-----------------|-----|
+| Jersey numbers (1-2 digit) | High | BibSetValidator, SuspiciousPredictionFilter (≥0.85 for short), digit count | On chest like bibs, persistent, reinforced by voting if matches a valid bib |
+| Finish line clock | Medium | PersistentPersonBibAssociator (no person match) | Runner passing in front of clock may cause brief spatial match |
+| Sponsor banners / signage | Low | Person association, aspect ratio | Static, rarely matched to person |
+| Spectator clothing | Low | Detection zone, person tracking | Spectators rarely in detection zone |
+
+**Jersey Number Analysis**:
+- Giants 5K: many runners wearing NFL jerseys with 1-2 digit numbers
+- Jersey numbers are on the chest — same location as bibs, same spatial match
+- They move with the runner — not filtered by static region suppression
+- Temporal voting actually reinforces them over time
+- Key defenses: (1) bib set validation rejects numbers not in registration list, (2) digit count filtering penalizes 1-2 digit reads, (3) bib detection model should learn paper bibs vs jersey printing if trained properly
+- Remaining risk: jersey number that happens to match a valid bib number
+
+**Planned Mitigations**:
+- Static region suppression (automatic, no UI needed) — heatmap of detection locations, suppress persistent stationary detections (clocks, signs)
+- ROI exclusion zones (deferred to Phase 3 UI) — operator masks known false positive areas
+- Negative training examples — include jerseys, clocks, signage in bib detector training as negatives
+
+**Accuracy Expectations by Phase**:
+
+| Phase | Conditions | Expected Read Rate | Key Limiting Factor |
+|-------|-----------|-------------------|-------------------|
+| Phase 1 (PoC, recorded video) | Controlled, good footage | 80-85% | OCR model quality |
+| Phase 2 (on-device, live) | Real-time constraints | 75-85% | Inference speed tradeoffs |
+| Phase 3 (field, backup) | Real race conditions | 70-85% | Occlusion in packs, lighting, bib damage |
+| Phase 4+ (hardened) | All conditions | 80-90% | Fundamental camera limitations |
+
+**Camera vs RFID — Realistic Role Assessment**:
+
+Camera-based detection has fundamental limitations that prevent full RFID replacement for large/competitive races:
+- **Occlusion**: Runners in packs hide each other's bibs. RFID reads through bodies.
+- **Bib damage**: Folded, covered by jackets, wet, pinned wrong. RFID chips are embedded.
+- **Lighting**: Dawn/dusk starts, backlighting, shadows. RFID is light-independent.
+- **Weather**: Rain degrades image quality. RFID is weather-independent.
+
+Camera advantages RFID lacks:
+- **No per-participant cost** (no chips/bibs)
+- **Visual evidence** of crossing
+- **Position ordering** visible even without bib reads
+- **Any location** — point a camera anywhere, no antenna infrastructure
+- **Finish photo equivalent** — evidence store provides automatic finish photos
+
+**Projected maturity trajectory**:
+1. **Near-term**: Backup to RFID — catches missed reads, provides visual evidence
+2. **Medium-term**: Co-primary — camera + RFID combined read rate higher than either alone
+3. **Possible**: Primary for small/casual races (<500 runners) where RFID cost isn't justified
+4. **Unlikely**: Full RFID replacement for large/competitive races
+
+**Network Architecture Decision**:
+Race timers connect laptops via cellular hotspot to cloud-based scoring. RFID readers have independent 4G connections to ChronoTrack. No local network switch exists at the finish line. Jetson joins the operator's hotspot — both devices on the same network, zero workflow change. See DD-020.
+
+**Next Steps**:
+- Run Giants 5K test video to measure actual jersey/clock false positive rates
+- Implement static region suppression if clock false positives appear
+- Assess whether bib detector model needs negative training examples for jerseys
+
+### Entry 2026-02-14: Giants 5K Full Video Run — Performance Fixes & Ground Truth Comparison (Run 3)
+
+**Phase/Milestone**: 1.4 - Basic Video Processing
+
+**Objective**:
+Run the full 30min Giants 5K video (REC-0006-A, 54,002 frames) on Jetson Orin Nano Super with performance fixes, validate against ground truth finish order (480 finishers).
+
+**Performance Fixes Applied (commit b7dff26)**:
+1. **Batch PARSeq OCR**: Single GPU forward pass for all crops per frame (was N individual calls)
+2. **Drawing guard**: Skip all cv2 annotation calls when `--no-video` and not showing
+3. **Frame stride option**: `--stride N` to process every Nth frame (not used this run)
+4. **Dead track pruning**: Clear voting/consensus dicts for deregistered tracks each frame — fixes unbounded memory growth that caused silent crash at ~22k frames
+
+**Pipeline Configuration**:
+- `--no-video --bib-set data/race_bibs_5k.txt --timing-line 0.52,0.0,0.52,1.0 --crossing-direction left_to_right --placement right`
+- PARSeq OCR on GPU (CUDA), YOLOv8n bib detector, YOLOv8n-pose person detector
+
+**Performance Results**:
+
+| Metric | Run 2 (REC-0011) | Run 3 (REC-0006) |
+|--------|-------------------|-------------------|
+| Frames processed | ~22,000 (crash) | **54,002 (100%)** |
+| Total runtime | ~22min (crash) | ~45min |
+| Avg throughput | ~17 fps | ~20 fps overall |
+| Sparse sections | — | **36.5 fps** |
+| Dense sections | — | ~11 fps |
+| Crash at ~22k frames | Yes | **No** |
+| Avg detection time | — | 31.3 ms/frame |
+| Avg OCR time | — | 37.6 ms/detection |
+| Avg pose time | — | 37.2 ms/frame |
+
+The crash fix works. Throughput exceeds 30 fps in sparse sections but drops to ~11 fps during dense packs (more bibs = more OCR crops per frame). Batch OCR helps but doesn't fully overcome the serial YOLO+PARSeq+Pose pipeline.
+
+**Detection Results**:
+
+| Metric | Value |
+|--------|-------|
+| Total detections (OCR calls) | 71,493 |
+| Unique bib tracks | 1,679 |
+| Edge-rejected crops | 22,163 |
+| Quality-rejected crops | 13,790 |
+| Partial/obstructed rejected | 1,777 |
+| OCR calls saved by filters | 37,730 |
+| OCR cleanups applied | 19,896 |
+| HIGH confidence tracks | 407 |
+| MEDIUM confidence tracks | 65 |
+| LOW confidence tracks | 132 |
+| REJECT tracks | 749 |
+
+**Crossing Detection Results**:
+
+| Metric | Value |
+|--------|-------|
+| Total crossings detected | 207 |
+| With bib identified | 106 (51%) |
+| UNKNOWN (no bib) | 101 (49%) |
+| Dedup suppressed | 46 |
+| Person tracks created | 2,612 |
+
+**Ground Truth Comparison** (480 finishers in bib_order.txt):
+
+| Metric | Value |
+|--------|-------|
+| **Crossing recall** | 207/480 = **43%** detected |
+| **Bib recall** | 37/480 = **7.7%** correctly identified |
+| **Precision** | 47/106 = **44%** of identified bibs are real |
+| **False positive bibs** | 54 unique bib numbers not in ground truth |
+| **Order accuracy (LCS)** | 9/37 = **24%** of correct bibs in right order |
+
+**Deep-Dive: Why Recall is Low**
+
+*Analysis of first 50 ground truth finishers*:
+- 31/50 (62%) were detected by OCR at some point in the detections CSV
+- 11/50 (22%) made it to a crossing record
+- 20/50 (40%) were detected by OCR but never had a crossing event — **crossing detection is the gap, not OCR**
+- 19/50 (38%) were never detected at all — bib detector misses
+
+*Multi-crossing tracks*:
+- 179 distinct person tracks produced 207 crossings
+- 15 tracks crossed more than once (28 extra crossings)
+- Worst: track 223 crossed **10 times** over 158 seconds, all UNKNOWN — person lingering near timing line
+- Tracks 335, 430, 460, 505, 554 also had repeated crossings
+
+**Root Cause Analysis — Five Failure Modes**:
+
+1. **Persons oscillating at timing line** (inflates crossing count):
+   Track 223 has chest_x ≈ 0.52 (exactly on the timing line) across 10 crossings spanning 158 seconds. Small jitter in chest keypoint detection causes the side-of-line to flip repeatedly. Each flip after the 2s debounce fires a new crossing. This single person accounts for 10/101 UNKNOWN crossings.
+
+2. **UNKNOWN crossings never deduplicated** (inflates UNKNOWN count):
+   `BibCrossingDeduplicator.should_emit()` has `if bib_number == "UNKNOWN": return True` — UNKNOWNs always pass. Track 223's 10 UNKNOWN crossings are all emitted. Per-track debounce only prevents same track within 2 seconds.
+
+3. **Bib detector misses** (38% of GT bibs never detected):
+   19 of the first 50 GT bibs never appear in the detections CSV at all. These runners' bibs were never detected by YOLO — too small, occluded, or bib folded/covered.
+
+4. **Crossing detector misses detected bibs** (40% detected but no crossing):
+   20 of the first 50 GT bibs have OCR detections but no crossing event. The person tracker failed to link the chest keypoint crossing to these bib observations — association failure or person track fragmentation.
+
+5. **OCR misreads create false positives** (54 phantom bibs):
+   Short OCR fragments (e.g., "65" from "1265", "39" from "1039") happen to be valid bib numbers. They pass validation, accumulate votes, and get emitted as crossings. Evidence: bibs 1, 2, 6 appear as the most common "detections" with 35, 13, and 13 tracks respectively — these are almost certainly single-digit OCR fragments.
+
+**UNKNOWN Rate by Time Segment**:
+
+| Segment | Crossings | Identified | ID Rate |
+|---------|-----------|------------|---------|
+| 0-10 min | 38 | 13 | 34% |
+| 10-20 min | 100 | 64 | **64%** |
+| 20-30 min | 69 | 29 | 42% |
+
+Best identification rate in the densest section (10-20 min) where more bibs are visible for longer. Early (fast leaders) and late (spread out) runners have lower rates.
+
+**Analysis**:
+The pipeline successfully processes the full 30-min video without crashing, confirming the memory leak fix. However, accuracy is far below usable levels. The primary bottleneck is **crossing detection**, not OCR — 62% of bibs are seen by OCR at some point but only 22% make it to a crossing event. The secondary issue is **crossing inflation** from lingering tracks.
+
+**Implications for Project**:
+- Performance fixes validated (full video, no crash, 36+ fps in sparse sections)
+- Accuracy requires fundamental crossing detection improvements (see DD-022)
+- The 43% crossing recall means the pipeline misses more than half of finishers — unacceptable even for a backup system
+- False positive rate (56% of identifications wrong) would corrupt race results
+- Priority order for improvement: (1) crossing hysteresis, (2) UNKNOWN dedup by track, (3) bib-person association, (4) false positive filtering
+
+**Attachments**:
+- Ground truth: `bib_order.txt` (480 finishers in order)
+- Crossings: `runs/pipeline_test/REC-0006-A_crossings.csv`
+- Detections: `runs/pipeline_test/REC-0006-A_detections.csv`
+
+---
+
 ## Phase 2: Real-World Testing
 
 *Future entries*
@@ -476,3 +670,6 @@ Track performance measurements across phases:
 | E009 | 2026-02-13 | 1.3 | Pipeline tuning run 1 (min_votes=3) | Dupes 31→19, UNKNOWN 60%→70% | min_votes too aggressive |
 | E010 | 2026-02-13 | 1.3 | Pipeline tuning run 2 (min_votes=1) | Dupes 31→20, UNKNOWN 60%→69% | min_votes not the bottleneck |
 | E011 | 2026-02-13 | 1.3 | Identification drop root cause | 57% were phantom dupes, rest OCR misreads | Drop is mostly correct behavior |
+| E012 | 2026-02-14 | 1.3 | False positive source analysis | Jersey numbers high risk, clocks medium | Bib set validation is strongest defense |
+| E013 | 2026-02-14 | 1.4 | Pipeline perf fixes (batch OCR, pruning) | Full video, no crash, 36fps sparse | Dead track pruning fixes OOM crash |
+| E014 | 2026-02-14 | 1.4 | Giants 5K ground truth comparison | 7.7% bib recall, 44% precision | Crossing detection is the bottleneck, not OCR |

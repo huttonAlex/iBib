@@ -75,26 +75,43 @@ class TestTimingLine:
 
 class TestCrossingDetector:
     def test_crossing_fires_once(self):
-        """Moving from one side to the other fires exactly once."""
+        """Moving from one side to the other fires after hysteresis frames."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
-        det = CrossingDetector(line, direction="any", debounce_frames=5)
+        det = CrossingDetector(
+            line, direction="any", debounce_frames=5, hysteresis_frames=1
+        )
 
         # Establish position on the left
         assert det.check(1, 0.3, 0.5, 1) is False
-        # Cross to the right
+        # Cross to the right (hysteresis=1 → fires immediately)
         assert det.check(1, 0.7, 0.5, 2) is True
         # Stay on the right — no new crossing
         assert det.check(1, 0.8, 0.5, 3) is False
 
+    def test_crossing_with_default_hysteresis(self):
+        """With default hysteresis=3, need 3 frames on new side to fire."""
+        line = TimingLine(0.5, 0.0, 0.5, 1.0)
+        det = CrossingDetector(line, direction="any", debounce_frames=5)
+
+        det.check(1, 0.3, 0.5, 1)  # establish left
+        assert det.check(1, 0.7, 0.5, 2) is False  # 1st frame on right
+        assert det.check(1, 0.7, 0.5, 3) is False  # 2nd frame on right
+        assert det.check(1, 0.7, 0.5, 4) is True   # 3rd frame → confirmed
+
     def test_debounce(self):
         """A second crossing within debounce window is suppressed."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
-        det = CrossingDetector(line, direction="any", debounce_frames=10)
+        det = CrossingDetector(
+            line, direction="any", debounce_frames=10, hysteresis_frames=1
+        )
 
-        det.check(1, 0.3, 0.5, 1)  # left
+        det.check(1, 0.3, 0.5, 1)  # establish left
         assert det.check(1, 0.7, 0.5, 2) is True  # cross right (frame 2)
-        det.check(1, 0.3, 0.5, 5)  # back to left — suppressed (5-2=3 < 10)
-        assert det.check(1, 0.7, 0.5, 6) is False  # within debounce (6-2=4 < 10)
+
+        # Back to left within debounce — suppressed
+        assert det.check(1, 0.3, 0.5, 5) is False  # 5-2=3 < 10
+        # Right again — still within debounce
+        assert det.check(1, 0.7, 0.5, 6) is False  # 6-2=4 < 10
 
         # After debounce expires (20-2=18 > 10), next side change fires
         assert det.check(1, 0.3, 0.5, 20) is True  # crossing accepted
@@ -102,7 +119,9 @@ class TestCrossingDetector:
     def test_direction_filter_left_to_right(self):
         """Only left-to-right crossings fire."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
-        det = CrossingDetector(line, direction="left_to_right", debounce_frames=0)
+        det = CrossingDetector(
+            line, direction="left_to_right", debounce_frames=0, hysteresis_frames=1
+        )
 
         det.check(1, 0.3, 0.5, 1)  # left side
         # For a vertical line at x=0.5 going from (0.5,0) to (0.5,1):
@@ -116,7 +135,9 @@ class TestCrossingDetector:
     def test_direction_filter_rejects_opposite(self):
         """Right-to-left crossing does not fire when direction is left_to_right."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
-        det = CrossingDetector(line, direction="left_to_right", debounce_frames=0)
+        det = CrossingDetector(
+            line, direction="left_to_right", debounce_frames=0, hysteresis_frames=1
+        )
 
         det.check(1, 0.7, 0.5, 1)  # right side
         result = det.check(1, 0.3, 0.5, 2)  # cross to left
@@ -125,7 +146,9 @@ class TestCrossingDetector:
     def test_multiple_tracks(self):
         """Independent tracks are tracked separately."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
-        det = CrossingDetector(line, direction="any", debounce_frames=0)
+        det = CrossingDetector(
+            line, direction="any", debounce_frames=0, hysteresis_frames=1
+        )
 
         det.check(1, 0.3, 0.5, 1)
         det.check(2, 0.3, 0.5, 1)
@@ -144,12 +167,40 @@ class TestCrossingDetector:
 
         assert 2 not in det._prev_side
         assert 1 in det._prev_side
+        assert 2 not in det._pending
 
     def test_no_crossing_without_prior_position(self):
         """First observation of a track is not a crossing."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
         det = CrossingDetector(line, direction="any", debounce_frames=0)
         assert det.check(1, 0.7, 0.5, 1) is False
+
+    def test_hysteresis_suppresses_jitter(self):
+        """Rapid side alternation (jitter) never produces a crossing."""
+        line = TimingLine(0.5, 0.0, 0.5, 1.0)
+        det = CrossingDetector(
+            line, direction="any", debounce_frames=0, hysteresis_frames=3
+        )
+
+        det.check(1, 0.3, 0.5, 0)  # establish left
+        # Alternate sides every frame — never stays on new side long enough
+        for i in range(1, 20):
+            x = 0.7 if i % 2 == 1 else 0.3
+            result = det.check(1, x, 0.5, i)
+            assert result is False, f"Jitter fired at frame {i}"
+
+    def test_hysteresis_clean_crossing(self):
+        """A clean crossing (stay on new side for N frames) fires exactly once."""
+        line = TimingLine(0.5, 0.0, 0.5, 1.0)
+        det = CrossingDetector(
+            line, direction="any", debounce_frames=0, hysteresis_frames=3
+        )
+
+        det.check(1, 0.3, 0.5, 0)  # establish left
+        assert det.check(1, 0.7, 0.5, 1) is False  # frame 1 on right
+        assert det.check(1, 0.7, 0.5, 2) is False  # frame 2 on right
+        assert det.check(1, 0.7, 0.5, 3) is True   # frame 3 → confirmed
+        assert det.check(1, 0.7, 0.5, 4) is False  # no re-fire
 
 
 # ---------------------------------------------------------------------------
@@ -405,12 +456,28 @@ class TestBibCrossingDeduplicator:
         # 2nd emission requires >= 0.7 and debounce expired (250-100=150 > 100)
         assert dedup.should_emit("1234", frame_idx=250, confidence=0.8) is True
 
-    def test_unknown_always_passes(self):
-        """UNKNOWN bibs are never deduplicated."""
+    def test_unknown_always_passes_without_track(self):
+        """UNKNOWN bibs without track_id are never deduplicated."""
         dedup = BibCrossingDeduplicator(debounce_frames=300)
         assert dedup.should_emit("UNKNOWN", frame_idx=100) is True
         assert dedup.should_emit("UNKNOWN", frame_idx=101) is True
         assert dedup.should_emit("UNKNOWN", frame_idx=102) is True
+
+    def test_unknown_dedup_by_track(self):
+        """Same track_id UNKNOWN within debounce window is suppressed."""
+        dedup = BibCrossingDeduplicator(debounce_frames=300)
+        assert dedup.should_emit("UNKNOWN", frame_idx=100, track_id=5) is True
+        assert dedup.should_emit("UNKNOWN", frame_idx=101, track_id=5) is False
+        assert dedup.should_emit("UNKNOWN", frame_idx=102, track_id=5) is False
+        # After debounce expires
+        assert dedup.should_emit("UNKNOWN", frame_idx=500, track_id=5) is True
+
+    def test_unknown_different_tracks(self):
+        """Different track_ids both pass for UNKNOWN."""
+        dedup = BibCrossingDeduplicator(debounce_frames=300)
+        assert dedup.should_emit("UNKNOWN", frame_idx=100, track_id=5) is True
+        assert dedup.should_emit("UNKNOWN", frame_idx=100, track_id=6) is True
+        assert dedup.should_emit("UNKNOWN", frame_idx=101, track_id=7) is True
 
     def test_different_bibs_independent(self):
         """Different bibs are tracked independently."""

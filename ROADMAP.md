@@ -179,18 +179,45 @@ This roadmap outlines the development path for PointCam from proof-of-concept to
 **Goal**: Deploy as backup system in real races
 
 ### Milestone 3.1: Web UI Implementation
-**Deliverables:**
-- [ ] Implement FastAPI backend
-- [ ] Build dashboard page (status, recent crossings)
-- [ ] Build setup page (timing line calibration)
-- [ ] Build evidence viewer
-- [ ] Build settings page
+**Architecture**: FastAPI backend on Jetson, browser-based frontend. Jetson joins operator's existing cellular hotspot (see DD-020). UI accessed via `http://pointcam.local:8080` from scoring laptop browser tab.
+
+**Deliverables — Pre-Race Setup:**
+- [ ] Implement FastAPI backend with static file serving
+- [ ] Live camera feed preview (reduced resolution MJPEG stream)
+- [ ] Timing line placement — draw virtual finish line on live video
+- [ ] Exclusion zone editor — mask out clocks, banners, signage (see DD-021)
+- [ ] Detection zone definition — restrict bib detection to relevant frame areas
+- [ ] Bib list import — CSV upload of registered bib numbers for validation
+- [ ] Expected digit range configuration (e.g., bibs 1-9999)
+- [ ] Hardware diagnostics — GPS lock, network status, storage, temperature
+
+**Deliverables — Live Race Monitoring:**
+- [ ] Live annotated feed — bounding boxes, bib reads, timing line overlaid
+- [ ] Crossing log — real-time scrolling list with bib, time, confidence, thumbnail
+- [ ] Confidence indicators — color-coded (green/yellow/red) at-a-glance status
+- [ ] Alert panel — consecutive UNKNOWNs, camera obstruction, GPS loss, network drop
+- [ ] Quick correction — tap flagged crossing, see frame, type correct bib
+- [ ] Stats dashboard — total crossings, read rate %, UNKNOWN count, throughput
+- [ ] CTP01 queue status — sent, queued, retry status
+
+**Deliverables — Post-Race Review:**
+- [ ] Review queue — LOW confidence and flagged readings sorted by priority
+- [ ] Timeline scrubber — video timeline with crossings overlaid, jump to any frame
+- [ ] Missing bib finder — registered bibs never seen (DNS vs missed reads)
+- [ ] Duplicate detection — same bib crossed twice, operator confirms or deletes
+- [ ] Export — CSV results, CTP01 replay, evidence package
+- [ ] Accuracy report — comparison with RFID data if available
+
+**Deliverables — System:**
+- [ ] Profile save/load — save venue setup (timing line, exclusion zones, camera config)
+- [ ] mDNS/Avahi for hostname resolution, fallback IP display
 - [ ] Test on mobile devices (phone/tablet)
 
 **Success Criteria:**
-- Operator can configure unit via phone browser
-- Real-time status visible
-- Timing line calibration working
+- Operator can configure unit via laptop/phone browser on same hotspot
+- Real-time status visible during race
+- Timing line calibration and exclusion zones working
+- Post-race review queue functional
 - Evidence photos viewable
 
 ---

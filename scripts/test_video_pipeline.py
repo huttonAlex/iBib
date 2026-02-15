@@ -375,7 +375,7 @@ def process_video(
                 expected_digits = {len(b) for b in bib_validator.bib_set if b}
 
             person_bib_assoc = PersistentPersonBibAssociator(
-                max_distance=150,
+                max_distance=250,
                 memory_frames=int(4.0 * fps),  # 4 seconds
                 min_votes=1,
                 min_confidence=0.4,
@@ -660,8 +660,15 @@ def process_video(
                                         confidence = fc_conf
                                         break
 
+                    # Short fragment suppression: demote 1-2 digit low-conf bibs
+                    if bib_number != "UNKNOWN" and len(bib_number) <= 2 and confidence < 0.90:
+                        bib_number = "UNKNOWN"
+                        confidence = 0.0
+
                     # Bib-level dedup (with escalating confidence)
-                    if not bib_dedup.should_emit(bib_number, frame_idx, confidence):
+                    if not bib_dedup.should_emit(
+                        bib_number, frame_idx, confidence, track_id=pid
+                    ):
                         dedup_suppressed += 1
                         continue
 
@@ -706,8 +713,15 @@ def process_video(
                     if track_id in final_consensus:
                         bib_number, confidence, _ = final_consensus[track_id]
 
+                    # Short fragment suppression: demote 1-2 digit low-conf bibs
+                    if bib_number != "UNKNOWN" and len(bib_number) <= 2 and confidence < 0.90:
+                        bib_number = "UNKNOWN"
+                        confidence = 0.0
+
                     # Bib-level dedup (with escalating confidence)
-                    if not bib_dedup.should_emit(bib_number, frame_idx, confidence):
+                    if not bib_dedup.should_emit(
+                        bib_number, frame_idx, confidence, track_id=track_id
+                    ):
                         dedup_suppressed += 1
                         continue
 
