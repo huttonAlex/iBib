@@ -59,8 +59,20 @@ def export_crnn_trtexec(onnx_path: str, engine_path: str, fp16: bool = True) -> 
     Returns:
         Path to the exported .engine file.
     """
+    import shutil
+
+    trtexec_bin = shutil.which("trtexec")
+    if trtexec_bin is None:
+        # Jetson default install location
+        default = "/usr/src/tensorrt/bin/trtexec"
+        if Path(default).exists():
+            trtexec_bin = default
+        else:
+            print("  ERROR: trtexec not found on PATH or at /usr/src/tensorrt/bin/trtexec")
+            sys.exit(1)
+
     cmd = [
-        "trtexec",
+        trtexec_bin,
         f"--onnx={onnx_path}",
         f"--saveEngine={engine_path}",
     ]
