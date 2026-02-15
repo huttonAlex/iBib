@@ -726,8 +726,68 @@ Track reusable code patterns discovered during development:
 
 Track performance measurements across phases:
 
+### Evaluation Scorecard
+
+Standard metrics for comparing pipeline runs. Every benchmark run should report all of these.
+
+**Test configuration** (record for each run):
+- Video file, start time, frame range
+- Hardware (Jetson Orin Nano Super, CPU clock, GPU clock)
+- Model backends (PyTorch .pt / TensorRT .engine / ONNX)
+- OCR model + backend (PARSeq/CRNN, pytorch/tensorrt)
+- Flags: stride, OCR skip, video writing, etc.
+
+#### Performance Metrics
+
+| Metric | Definition | Target |
+|--------|-----------|--------|
+| **Wall clock (s)** | Total processing time from first to last frame | — |
+| **Throughput (fps)** | Frames processed / wall clock seconds | ≥30 fps |
+| **Avg detection time (ms)** | YOLO bib detector per-frame latency | ≤10 ms |
+| **Avg pose time (ms)** | YOLOv8n-pose per-frame latency | ≤12 ms |
+| **Avg OCR time (ms)** | OCR per-detection latency | ≤15 ms |
+| **OCR calls** | Total OCR forward passes | lower = better |
+| **OCR skip count** | OCR calls avoided by stable-track skip | higher = better |
+| **OCR skip rate** | skip_count / (skip_count + OCR calls) | 30-50% target |
+
+#### Accuracy Metrics (vs ground truth)
+
+| Metric | Definition | Target |
+|--------|-----------|--------|
+| **Crossing recall** | Crossings detected / GT finishers | ≥80% |
+| **Bib recall** | Correct unique bibs / GT finishers | ≥70% |
+| **Precision** | Correct bibs / all unique bibs detected | ≥80% |
+| **False positive bibs** | Unique bibs not in GT | ≤10 |
+| **UNKNOWN rate** | UNKNOWN crossings / total crossings | ≤20% |
+| **Duplicate bibs** | Bibs appearing in >1 crossing | ≤5 |
+
+#### Secondary Metrics
+
+| Metric | Definition | Notes |
+|--------|-----------|-------|
+| **Identified crossings** | Non-UNKNOWN crossings | Numerator for ID rate |
+| **ID rate** | Identified / total crossings | Higher = better |
+| **Confidence distribution** | HIGH / MEDIUM / LOW / REJECT track counts | Should be majority HIGH |
+| **Edge/quality rejected** | Crops filtered before OCR | Compute savings |
+| **Cleanup modifications** | Post-OCR corrections applied | Indicates OCR error rate |
+
 ### Phase 1 Baselines
-*To be populated during Phase 1.2*
+
+**Standard test: REC-0006-A.mp4 (Giants 5K, 30fps, 1800s, 480 finishers)**
+
+| Run | Date | Config | FPS | Wall (min) | Crossings | ID'd | Correct Bibs | Precision | UNKNOWN% |
+|-----|------|--------|-----|-----------|-----------|------|-------------|-----------|----------|
+| Run 3 | 2026-02-14 | PyTorch, full video, stride 1 | ~20 avg | ~45 | 207 | 106 | 37 | 44% | 49% |
+| Run 4a | 2026-02-15 | PyTorch, from 460s, no OCR skip | ~7 | 96 | 178 | 102 | 34 | 36.6% | 43% |
+| Run 4b | 2026-02-15 | TRT YOLO + OCR skip, from 460s | ~10.5 | 64 | 183 | 112 | 34 | 32.7% | 39% |
+
+**Notes on Run 4 comparison:**
+- TRT YOLO engines cut detection+pose from ~68ms to ~20ms per frame
+- OCR skip reduced OCR calls by 51% (49,950 → 24,352)
+- Wall clock 1.5x faster (96→64 min), bottleneck is now PyTorch PARSeq OCR (38ms/batch)
+- Correct bib count identical (34), but TRT run has more false positives (+11)
+- jetson_clocks locked CPU at 1.34 GHz (was 729 MHz) for both runs
+- Next step: TensorRT OCR backend to address remaining OCR bottleneck
 
 ### Phase 2 Baselines
 *To be populated during Phase 2*
@@ -755,4 +815,4 @@ Track performance measurements across phases:
 | E012 | 2026-02-14 | 1.3 | False positive source analysis | Jersey numbers high risk, clocks medium | Bib set validation is strongest defense |
 | E013 | 2026-02-14 | 1.4 | Pipeline perf fixes (batch OCR, pruning) | Full video, no crash, 36fps sparse | Dead track pruning fixes OOM crash |
 | E014 | 2026-02-14 | 1.4 | Giants 5K ground truth comparison | 7.7% bib recall, 44% precision | Crossing detection is the bottleneck, not OCR |
-| E015 | 2026-02-15 | 1.4 | TensorRT optimization implementation | Pending Jetson validation | TRT export, OCR skip, jetson_clocks |
+| E015 | 2026-02-15 | 1.4 | TensorRT YOLO + OCR skip benchmark | 1.5x faster, 34 correct bibs (same) | OCR still bottleneck at 38ms PyTorch |
