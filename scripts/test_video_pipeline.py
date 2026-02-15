@@ -215,6 +215,7 @@ def process_video(
     enable_person_detect: bool = True,
     pose_model_path: str = "yolov8n-pose.pt",
     stride: int = 1,
+    start_time: float = 0.0,
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -387,6 +388,12 @@ def process_video(
 
         crossing_log_path = output_dir / f"{Path(video_path).stem}_crossings.csv"
         crossing_log = CrossingEventLog(crossing_log_path)
+
+    # Seek past dead time at the start of the video
+    if start_time > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
+        frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        print(f"Start time: {start_time:.1f}s (seeking to frame {frame_idx})")
 
     if stride > 1:
         print(f"Frame stride: {stride} (processing every {stride}th frame)")
@@ -956,6 +963,12 @@ def main():
         default=1,
         help="Process every Nth frame (default: 1, no skipping)",
     )
+    parser.add_argument(
+        "--start-time",
+        type=float,
+        default=0.0,
+        help="Skip to this time in seconds before processing (default: 0.0)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -1051,6 +1064,7 @@ def main():
         enable_person_detect=not args.no_person_detect,
         pose_model_path=args.pose_model,
         stride=args.stride,
+        start_time=args.start_time,
     )
 
     print("\nDone!")
