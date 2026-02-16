@@ -630,6 +630,7 @@ class BibCrossingDeduplicator:
 
     DEFAULT_ESCALATION = {1: 0.0, 2: 0.7}  # 3+ uses fallback
     ESCALATION_FALLBACK = 0.9  # Required confidence for 3rd+ emission
+    MAX_EMISSIONS_PER_BIB = 3  # Hard cap: no bib emitted more than 3 times
 
     def __init__(
         self,
@@ -688,8 +689,10 @@ class BibCrossingDeduplicator:
         if last is not None and frame_idx - last < self.debounce_frames:
             return False
 
-        # Escalating confidence check
+        # Escalating confidence check + hard cap
         count = self._emission_count.get(bib_number, 0)
+        if count >= self.MAX_EMISSIONS_PER_BIB:
+            return False
         next_count = count + 1
         required = self.escalation_thresholds.get(next_count, self.ESCALATION_FALLBACK)
         if confidence < required:

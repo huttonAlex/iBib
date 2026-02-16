@@ -367,7 +367,7 @@ def process_video(
 
     # Zone-based crossing: track which person tracks have already fired
     person_track_emitted: set = set()  # track IDs that have emitted a crossing
-    ZONE_MIN_FRAMES = 5  # minimum frames a track must exist before emitting
+    ZONE_MIN_FRAMES = 30  # minimum frames (~1s at 30fps) before emitting
 
     # Enable crossing detection for either timing-line mode or zone mode
     enable_crossings = timing_line_coords is not None or crossing_mode == "zone"
@@ -983,7 +983,7 @@ def process_video(
     review_count = len(confidence_mgr.get_pending_reviews())
     print(f"\nItems flagged for review: {review_count}")
 
-    if timing_line is not None:
+    if enable_crossings:
         print(f"\nCrossing Detection:")
         print(f"  Total crossings: {total_crossings}")
         print(f"  With bib: {total_crossings - unknown_crossings}")
