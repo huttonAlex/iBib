@@ -159,7 +159,7 @@ class BibSetValidator:
             validated=prediction,
             is_valid=False,
             is_corrected=False,
-            confidence_boost=-0.2,  # Penalize unvalidated predictions
+            confidence_boost=-0.05,  # Mild penalty for unvalidated predictions
             alternatives=[],
         )
 

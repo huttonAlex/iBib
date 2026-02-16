@@ -444,7 +444,7 @@ class PersistentPersonBibAssociator:
     subject to minimum vote and confidence thresholds.
 
     Vote weights by confidence level:
-        HIGH: 3, MEDIUM: 2, LOW: 1, REJECT: 0 (skipped).
+        HIGH: 3, MEDIUM: 2, LOW: 1, REJECT: 0.5 (low but non-zero).
 
     Short bib numbers (fewer digits than expected) receive halved vote weight
     when ``expected_digit_counts`` is provided.
@@ -459,7 +459,7 @@ class PersistentPersonBibAssociator:
     """
 
     # Weighted votes per confidence level
-    LEVEL_WEIGHTS: Dict[str, int] = {"high": 3, "medium": 2, "low": 1}
+    LEVEL_WEIGHTS: Dict[str, float] = {"high": 3, "medium": 2, "low": 1, "reject": 0.5}
 
     def __init__(
         self,
@@ -482,6 +482,8 @@ class PersistentPersonBibAssociator:
         self._votes: Dict[int, Dict[str, float]] = {}
         # person_track_id → last_frame_seen
         self._last_seen: Dict[int, int] = {}
+        # person_track_id → last known (cx, cy) centroid for cross-track seeding
+        self._positions: Dict[int, Tuple[float, float]] = {}
 
     def _vote_weight(self, bib_number: str, level: str) -> float:
         """Compute vote weight for a bib reading.
@@ -515,6 +517,41 @@ class PersistentPersonBibAssociator:
             final_consensus: {bid: (number, conf, level)} from OCR voting.
             frame_idx: Current frame number.
         """
+        # Cross-track vote seeding: transfer votes from recently-dead tracks
+        # to new nearby person tracks (handles track fragmentation).
+        current_pids = set(person_tracked.keys())
+        dead_pids = [
+            pid for pid in self._positions
+            if pid not in current_pids and pid in self._votes
+        ]
+        for pid in current_pids:
+            if pid in self._votes:
+                continue  # already has votes, skip
+            if pid not in person_tracked:
+                continue
+            p_centroid, _ = person_tracked[pid]
+            best_donor: Optional[int] = None
+            best_dist = self.max_distance
+            for dpid in dead_pids:
+                dcx, dcy = self._positions[dpid]
+                dist = np.sqrt((p_centroid[0] - dcx) ** 2 + (p_centroid[1] - dcy) ** 2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_donor = dpid
+            if best_donor is not None:
+                self._votes[pid] = dict(self._votes[best_donor])
+                # Remove donor to prevent double-seeding
+                del self._votes[best_donor]
+                dead_pids.remove(best_donor)
+                log.debug(
+                    "Cross-track seed: pid %d inherited votes from dead pid %d (dist=%.0f)",
+                    pid, best_donor, best_dist,
+                )
+
+        # Update positions for all current tracks
+        for pid, (p_centroid, _) in person_tracked.items():
+            self._positions[pid] = p_centroid
+
         # Pass 1: find each person's best bib candidate
         pid_best: Dict[int, Tuple[int, float]] = {}  # pid -> (bid, dist)
         for pid, (p_centroid, p_bbox) in person_tracked.items():
@@ -602,6 +639,7 @@ class PersistentPersonBibAssociator:
         for pid in stale:
             self._votes.pop(pid, None)
             self._last_seen.pop(pid, None)
+            self._positions.pop(pid, None)
 
 
 # ---------------------------------------------------------------------------

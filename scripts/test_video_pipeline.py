@@ -235,7 +235,7 @@ def process_video(
     tracker = CentroidTracker(max_disappeared=30, max_distance=100)
     voting = EnhancedTemporalVoting(
         window_size=15,
-        min_votes=3,
+        min_votes=1,
         stability_threshold=5,
         confidence_threshold=ocr_conf_threshold,
     )
@@ -248,7 +248,7 @@ def process_video(
         min_height=15,
         min_aspect_ratio=1.0,
         max_aspect_ratio=6.0,
-        min_completeness=0.6,
+        min_completeness=0.3,
         check_completeness=True,
     ) if enable_quality_filter else None
 
@@ -340,9 +340,14 @@ def process_video(
     # Track final consensus per track (pruned when stale)
     final_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
     final_consensus_frame: Dict[int, int] = {}  # track_id -> last frame_idx updated
-    consensus_ttl = int(5 * fps)  # prune entries dead longer than 5 seconds
+    consensus_ttl = int(30 * fps)  # prune entries dead longer than 30 seconds
     # All-time best consensus per track for summary stats (never pruned)
     all_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
+
+    # Historical bib positions: last known centroid per bib track (never pruned).
+    # Used for retroactive bib recovery when emitting UNKNOWN for dead person tracks.
+    bib_track_last_pos: Dict[int, Tuple[float, float]] = {}  # bid -> (cx, cy)
+    bib_track_last_frame: Dict[int, int] = {}  # bid -> last frame seen
 
     # --- Person detection + crossing detection (optional) ---
     timing_line = None
@@ -465,6 +470,11 @@ def process_video(
         # Update tracker
         tracked = tracker.update(detections)
 
+        # Update historical bib positions (for retroactive recovery)
+        for bid, (b_centroid, b_bbox) in tracked.items():
+            bib_track_last_pos[bid] = b_centroid
+            bib_track_last_frame[bid] = frame_idx
+
         # Phase 1: Collect crops and metadata for batch OCR
         ocr_batch_items = []  # (track_id, bbox, det_conf, crop)
         for track_id, (centroid, bbox) in tracked.items():
@@ -485,7 +495,6 @@ def process_video(
             )
             if not is_visible:
                 edge_rejected += 1
-                continue  # Skip bibs entering/exiting frame
 
             # Expand crop for OCR — padding varies by camera placement to
             # compensate for the far side of the bib being clipped by the angle
@@ -723,6 +732,7 @@ def process_video(
                 diag = person_track_diag[pid]
                 diag["last_frame"] = frame_idx
                 diag["last_chest"] = (p_centroid[0], p_centroid[1])
+                diag["last_bbox"] = p_bbox
                 diag["frames_seen"] += 1
 
             # Check each person for crossing
@@ -757,8 +767,8 @@ def process_video(
                         diag = person_track_diag.get(pid)
                         if diag:
                             lc = diag.get("last_chest", diag["first_chest"])
-                            # Use last known position
-                            tracks_to_emit.append((pid, lc, (0, 0, 0, 0)))
+                            lb = diag.get("last_bbox", (0, 0, 0, 0))
+                            tracks_to_emit.append((pid, lc, lb))
 
                 prev_person_tracked_ids = current_ids.copy()
             else:
@@ -809,6 +819,38 @@ def process_video(
                                     if fc_level == "high" and fc_conf > best_conf:
                                         best_bib = fc_number
                                         best_conf = fc_conf
+
+                    # Retroactive recovery: scan ALL historical bib positions
+                    # for HIGH/MEDIUM matches near this person's last chest.
+                    if best_bib is None:
+                        diag = person_track_diag.get(pid, {})
+                        person_first_frame = diag.get("first_frame", frame_idx)
+                        temporal_window = 2.0 * fps  # bib seen within 2s of person
+                        retro_margin = 400  # px search radius
+
+                        for bid, (bc_number, bc_conf, bc_level) in all_consensus.items():
+                            if bc_level not in ("high", "medium"):
+                                continue
+                            if bc_conf <= best_conf:
+                                continue
+                            # Temporal overlap: bib must have been seen near
+                            # person's lifetime
+                            bib_last = bib_track_last_frame.get(bid)
+                            if bib_last is None:
+                                continue
+                            if bib_last < person_first_frame - temporal_window:
+                                continue
+                            # Spatial proximity: bib's last position near
+                            # person's chest
+                            bpos = bib_track_last_pos.get(bid)
+                            if bpos is None:
+                                continue
+                            bcx, bcy = bpos
+                            chest_x, chest_y = p_centroid
+                            dist = ((bcx - chest_x) ** 2 + (bcy - chest_y) ** 2) ** 0.5
+                            if dist < retro_margin:
+                                best_bib = bc_number
+                                best_conf = bc_conf
 
                     if best_bib is not None:
                         bib_number = best_bib

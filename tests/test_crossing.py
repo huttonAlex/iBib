@@ -329,8 +329,8 @@ class TestPersistentPersonBibAssociator:
         # 5678 wins (6 > 5)
         assert assoc.get_bib(1) == "5678"
 
-    def test_reject_filtered_out(self):
-        """REJECT confidence level produces zero votes."""
+    def test_reject_low_weight(self):
+        """REJECT confidence level produces low-weight votes (0.5 each)."""
         assoc = PersistentPersonBibAssociator(
             max_distance=200, memory_frames=100, min_votes=1
         )
@@ -338,8 +338,33 @@ class TestPersistentPersonBibAssociator:
         bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
         consensus = {10: ("9999", 0.20, "reject")}
 
+        # 1 REJECT vote → 0.5 weight < min_votes=1 → not yet emitted
         assoc.update(person_tracked, bib_tracked, consensus, frame_idx=0)
         assert assoc.get_bib(1) is None
+
+        # 2 REJECT votes → 1.0 weight >= min_votes=1 → emitted
+        assoc.update(person_tracked, bib_tracked, consensus, frame_idx=1)
+        assert assoc.get_bib(1) == "9999"
+
+    def test_reject_outweighed_by_high(self):
+        """HIGH votes easily outweigh REJECT votes."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=1
+        )
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+
+        # 4 REJECT votes for "9999" → 4 × 0.5 = 2.0 weighted
+        consensus_reject = {10: ("9999", 0.20, "reject")}
+        for i in range(4):
+            assoc.update(person_tracked, bib_tracked, consensus_reject, frame_idx=i)
+
+        # 1 HIGH vote for "1234" → 1 × 3 = 3.0 weighted
+        consensus_high = {10: ("1234", 0.95, "high")}
+        assoc.update(person_tracked, bib_tracked, consensus_high, frame_idx=4)
+
+        # 1234 wins (3.0 > 2.0)
+        assert assoc.get_bib(1) == "1234"
 
     def test_min_votes_threshold(self):
         """Bib not emitted if below min_votes weighted threshold."""
@@ -428,6 +453,46 @@ class TestPersistentPersonBibAssociator:
 
         assoc.update(person_tracked, bib_tracked, consensus, frame_idx=0)
         assert assoc.get_bib(1) is None
+
+    def test_cross_track_vote_seeding(self):
+        """New person track inherits votes from nearby dead track."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=1
+        )
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+        consensus = {10: ("1234", 0.95, "high")}
+
+        # Track 1 accumulates votes at position (250, 300)
+        person_tracked_1 = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        for i in range(3):
+            assoc.update(person_tracked_1, bib_tracked, consensus, frame_idx=i)
+        assert assoc.get_bib(1) == "1234"
+
+        # Track 1 disappears, track 2 appears nearby (within max_distance)
+        person_tracked_2 = {2: ((260.0, 310.0), (210, 110, 310, 510))}
+        assoc.update(person_tracked_2, bib_tracked, {}, frame_idx=3)
+
+        # Track 2 should inherit votes from dead track 1
+        assert assoc.get_bib(2) == "1234"
+
+    def test_cross_track_no_seeding_when_too_far(self):
+        """No vote seeding when new track is too far from dead track."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=100, memory_frames=100, min_votes=1
+        )
+        bib_tracked = {10: ((250.0, 250.0), (230, 230, 270, 270))}
+        consensus = {10: ("1234", 0.95, "high")}
+
+        # Track 1 at position (100, 100)
+        person_tracked_1 = {1: ((100.0, 100.0), (50, 50, 150, 150))}
+        assoc.update(person_tracked_1, bib_tracked, consensus, frame_idx=0)
+
+        # Track 1 disappears, track 2 appears far away (500, 500)
+        person_tracked_2 = {2: ((500.0, 500.0), (450, 450, 550, 550))}
+        assoc.update(person_tracked_2, bib_tracked, {}, frame_idx=1)
+
+        # Track 2 should NOT inherit votes (too far)
+        assert assoc.get_bib(2) is None
 
 
 # ---------------------------------------------------------------------------
