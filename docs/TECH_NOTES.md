@@ -22,6 +22,103 @@ Entries are organized by phase and date. Each entry should include:
 
 ---
 
+## 2026-02-16: Zone-Based Crossing Detection (Runs 7-8)
+
+### Problem
+Timing line crossing detection fundamentally fails with head-on cameras:
+- **Vertical line** (x=0.52): Runners move in Z-axis toward camera, not X-axis. Crossings are keypoint jitter (h=3: 151 random crossings, h=5: 0, h=10: 0).
+- **Horizontal line** (y=0.65): Pose detector only detects people when already AT/PAST the line. Only 2 crossings in 180s.
+
+### Solution: Zone-Based Crossing
+Instead of detecting a line crossing, emit one crossing per person track after it persists for N frames. The pose detector's detection range IS the crossing zone.
+
+### Results
+
+| Metric | Run 4a (baseline) | Run 7 (zone=5) | Run 8 (zone=30, cap=3) |
+|--------|-------------------|-----------------|------------------------|
+| Bib Recall | 34/480 (7.1%) | 117/480 (24.4%) | **137/480 (28.5%)** |
+| Bib Precision | 36.6% | 33.9% | 30.6% |
+| Total crossings | 93 | 1095 | 1096 |
+| UNKNOWN rate | — | 47.2% | 47.7% |
+| FP bibs | — | 228 | 310 |
+| Max dup per bib | — | 56x (bib 185) | 3x (capped) |
+| Person tracks | — | 1742 | 2123 |
+
+### Key Changes (Run 8 vs Run 7)
+- `ZONE_MIN_FRAMES`: 5 → 30 (1 second delay for bib association)
+- `MAX_EMISSIONS_PER_BIB`: unlimited → 3 (hard cap eliminates phantom bibs)
+- `max_disappeared`: 45 → 20 (user fix: prevents phantom long-lived tracks)
+- `consensus_ttl`: 5 seconds (user fix: prunes stale bib consensus)
+
+### Remaining Bottlenecks (Priority Order)
+1. **OCR accuracy**: 310 FP bibs — OCR reads wrong numbers (fragments, partial digits)
+2. **Person track fragmentation**: 2123 tracks for 480 finishers (4.4x). max_disappeared=20 means brief occlusions create new tracks.
+3. **Bib association timing**: 47% UNKNOWN — zone fires before bib voting converges. Need "emit on identification or track death" strategy.
+4. **Bib detection recall**: Not all bibs are detected by YOLO, especially small/distant ones.
+
+### Next Steps
+- **Deferred emission**: Emit crossing when bib is identified OR when track dies (maximizes bib association window)
+- **Better OCR**: Fine-tune PARSeq on race-specific data, or try larger model
+- **YOLO retraining**: More training data for bib detection in various conditions
+
+---
+
+## 2026-02-16: Run 5c Results & Timing Line Geometry Mismatch
+
+### Run 5c Configuration
+- Hysteresis=3 (reverted from 5→3 after 5 also produced zero crossings)
+- CSV flush after each write (for real-time monitoring)
+- All accuracy-refactor changes from Run 5: wider association (350px, 30s memory), YOLO conf 0.25, max_disappeared=45, 1-UNKNOWN-per-track, fragment rejection, stop pruning final_consensus
+- TRT YOLO engines, PyTorch OCR
+
+### Run 5c Results (vs Run 4a baseline)
+
+| Metric | Run 4a | Run 5c | Change |
+|--------|--------|--------|--------|
+| Bib Recall | 34/480 (7.1%) | 31/480 (6.5%) | -0.6pp |
+| Bib Precision | 36.6% | 34.1% (31/91) | -2.5pp |
+| Total crossings | 93 | 151 | +62% |
+| UNKNOWN crossings | — | 36 (23.8%) | — |
+| False positive bibs | — | 60 | — |
+| Bib 185 duplicates | — | 17x | — |
+| Pairwise order accuracy | — | 62.6% | — |
+| Person tracks detected | — | 1742 | — |
+| Crossing rate (crossings/tracks) | — | 8.7% | — |
+| Avg pose time | — | 19.0ms/frame | — |
+
+### Root Cause: Timing Line Geometry Mismatch
+
+**The vertical timing line (x=0.52) fundamentally does not work with a head-on camera.**
+
+Evidence:
+- All 151 crossing chest_x values cluster within 10-20px of the timing line (998px)
+  - 85/151 (56%) within 10px, 122/151 (81%) within 20px
+  - Mean chest_x: 1013.1px, std dev: 19.0px
+- Runners approach TOWARD the camera (Z-axis), not left-to-right (X-axis)
+- The 151 "crossings" are actually keypoint jitter events, not real left-to-right motion
+- This explains the hysteresis sensitivity: h=10→0 crossings, h=5→0 crossings, h=3→151 crossings
+  - Random jitter rarely sustains 3+ consecutive frames on one side of a thin line
+
+### Hysteresis Tuning History
+
+| Hysteresis | Crossings | Explanation |
+|-----------|-----------|-------------|
+| 10 (Run 5) | 0 | Random jitter never sustains 10 frames |
+| 5 (Run 5b) | 0 | Still too strict for random jitter |
+| 3 (Run 5c) | 151 | Some jitter sequences align for 3 frames |
+| 3 (original Run 4) | 93 | Fewer crossings with original params |
+
+### Proposed Fix: Horizontal Timing Line
+
+For head-on cameras, runners move top-to-bottom (Y-axis) as they approach. Chest_y ranges from ~700 (far) to ~1080 (close). A horizontal timing line at the appropriate Y-value would detect actual physical motion rather than keypoint noise.
+
+### Other Issues Identified
+1. **Bib 185 emitted 17 times**: Escalating confidence dedup (0.7 for 2nd, 0.9 for 3rd+) insufficient — bib 185 has conf 0.9-1.0 consistently
+2. **60 false positive bibs**: OCR reading incorrect numbers (e.g., partial reads like "1065" for actual bibs)
+3. **Long-lived phantom tracks**: Person track 201 existed for 51 seconds with 5 crossings, reading 5 different bib numbers — suggests max_disappeared=45 is too high, allowing track ID reuse across different people
+
+---
+
 ## Phase 1: Proof of Concept
 
 ### Milestone 1.1: Dataset & Research
