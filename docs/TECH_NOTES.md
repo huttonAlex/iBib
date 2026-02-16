@@ -22,6 +22,78 @@ Entries are organized by phase and date. Each entry should include:
 
 ---
 
+## 2026-02-16: Cross-Track Bib Association & UNKNOWN Recovery (Run 10)
+
+### Changes (Issues #1-3 from Run 9 analysis)
+
+**Issue #1 — Consensus filter too strict** (user fix):
+- `min_votes` 3 → 1 (temporal voting)
+- `min_completeness` 0.6 → 0.3 (quality filter)
+- `consensus_ttl` 5s → 30s (stale bib pruning)
+- Validation penalty -0.2 → -0.05
+- Removed edge-rejection skip (bibs at frame edges now processed)
+
+**Issue #2 — Orphaned votes from track fragmentation**:
+- Cross-track vote seeding: when a new person track appears near a recently-dead track, transfer accumulated bib votes (prevents fragmentation from losing bib identity)
+- Added `_positions` dict to `PersistentPersonBibAssociator` for spatial matching
+
+**Issue #3 — UNKNOWN recovery**:
+- REJECT-level bibs now get 0.5 vote weight (was 0 — 64.7% of nearby detections were wasted)
+- Retroactive bib recovery at dead-track emission: scan all historical bib positions for HIGH/MEDIUM matches within 400px of person's chest, filtered by 2s temporal overlap
+- Dead-track emissions use real last_bbox instead of (0,0,0,0)
+
+### Results
+
+| Metric | Run 9 (deferred) | Run 10 (Issues #1-3) | Change |
+|--------|-------------------|----------------------|--------|
+| Bib Recall | **158/480 (32.9%)** | 139/480 (29.0%) | **-3.9pp** |
+| Bib Precision | 32.4% (158/488) | 32.6% (139/426) | +0.3pp |
+| Total crossings | 1,091 | 714 | -34.6% |
+| UNKNOWN | 392 (35.9%) | **105 (14.7%)** | **-21.2pp** |
+| With bib | 699 | 609 | -90 |
+| Unique bibs emitted | 488 | 426 | -62 |
+| OCR hallucinations | 7 | 7 | Same |
+| Person tracks (max ID) | 2,121 | 2,269 | +148 |
+| Tracks emitting | 1,091 (51.4%) | 714 (31.5%) | -20pp |
+
+### Analysis
+
+**UNKNOWN reduction succeeded**: 392 → 105 (-73%). The combination of REJECT vote weight, retroactive recovery, and cross-track seeding gives far more tracks a bib identity. This was the primary goal and it worked.
+
+**Recall regressed (-3.9pp)**: Lost 42 finisher bibs, gained 23. All 42 lost bibs had high confidence in Run 9 (mean 0.988). The gained bibs include lower-confidence recoveries (0.42-0.47) showing retroactive recovery is working.
+
+**Root cause of recall regression — dedup cascade**:
+The 377 fewer total crossings are the key. In zone mode, every person track emits exactly 1 crossing. Run 10 has MORE person tracks (2,269 vs 2,121) but FEWER emissions (714 vs 1,091). This means the bib-level deduplicator is suppressing 1,555 tracks in Run 10 vs 1,030 in Run 9 — **525 more suppressions**.
+
+The mechanism:
+1. Cross-track seeding + REJECT votes + retroactive recovery → more tracks get bib IDs
+2. Multiple fragmented tracks for the same person now all get the same bib (instead of 1 bib + N UNKNOWNs)
+3. Bib dedup allows only 3 emissions per bib → the 4th+ fragment is suppressed entirely
+4. If a non-finisher track claims a bib first (e.g., spectator near a runner), the finisher's track for that bib gets dedup-suppressed
+
+**Edge rejection removal amplifies the problem**: With edge bibs no longer skipped, partial OCR reads from frame-clipped bibs enter the voting system. With `min_votes=1` and `consensus_ttl=30s`, these noisy readings persist longer and can pollute bib assignments.
+
+### Positive Signals
+- Precision held (32.4% → 32.6%) — we're not introducing false bibs
+- OCR hallucinations unchanged (7) — quality filters still effective
+- UNKNOWN rate dropped from 35.9% to 14.7% — the pipeline now identifies most person tracks
+- 23 new finisher bibs gained that Run 9 missed entirely
+
+### Diagnosis: Where the 42 Lost Bibs Went
+The lost bibs weren't caused by a single mechanism. Likely contributors:
+1. **Dedup competition**: Non-finisher track claims bib before finisher track (cross-track seeding assigns bib to wrong fragment)
+2. **Vote pollution**: Longer TTL (30s) keeps stale/wrong bib consensus alive, which retroactive recovery then matches to wrong person tracks
+3. **Edge noise**: Partial bibs from frame edges produce wrong OCR readings that pollute voting at `min_votes=1`
+
+### Next Steps
+1. **Restore edge rejection** (`continue` after `edge_rejected`) — the ~6x increase in detections (1.5k → 75k OCR rows) suggests massive noise injection
+2. **Tune consensus_ttl**: 30s may be too long; try 10-15s as compromise between 5s and 30s
+3. **Add dedup awareness to retroactive recovery**: before assigning a bib via retroactive recovery, check if that bib has already been emitted (skip if so)
+4. **Consider per-bib-set enforcement at emission**: if a recovered bib is not in the bib set, demote to UNKNOWN
+5. **Profile cross-track seeding accuracy**: log donor→recipient transfers and check if they match the same person
+
+---
+
 ## 2026-02-16: Deferred Emission (Run 9)
 
 ### Change
@@ -1038,3 +1110,4 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | E015 | 2026-02-15 | 1.4 | TensorRT YOLO + OCR skip benchmark | 1.5x faster, 34 correct bibs (same) | OCR still bottleneck at 38ms PyTorch |
 | E016 | 2026-02-16 | 1.4 | Zone crossing Runs 7-8 | 28.5% recall, 30.6% precision | Zone mode, min_frames=30, cap=3 |
 | E017 | 2026-02-16 | 1.4 | Deferred emission Run 9 | 32.9% recall, 32.4% precision | Only 7/330 FP are OCR errors; rest are real bibs |
+| E018 | 2026-02-16 | 1.4 | Cross-track bib + UNKNOWN recovery Run 10 | 29.0% recall (-3.9pp), 14.7% UNKNOWN (-21.2pp) | UNKNOWN fix works; recall regressed from dedup cascade |
