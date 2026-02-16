@@ -22,6 +22,46 @@ Entries are organized by phase and date. Each entry should include:
 
 ---
 
+## 2026-02-16: Deferred Emission (Run 9)
+
+### Change
+Instead of emitting at a fixed frame count (30 frames), tracks are marked "ready" after 5 frames. Emission is deferred until either:
+1. **Bib identified** via association system → emit immediately
+2. **Track dies** (disappears from tracker) → emit with whatever we have (UNKNOWN if no bib)
+
+### Results
+
+| Metric | Run 8 (fixed 30-frame) | Run 9 (deferred) | Change |
+|--------|----------------------|-------------------|--------|
+| Bib Recall | 137/480 (28.5%) | **158/480 (32.9%)** | +4.4pp |
+| Bib Precision | 30.6% | 32.4% (158/488) | +1.8pp |
+| Total crossings | 448 | 1,091 | +143% |
+| UNKNOWN rate | 47.7% | 35.9% (392/1091) | -11.8pp |
+| Unique bibs emitted | — | 488 | — |
+| False positive bibs | 310 | 330 | — |
+| Person tracks | 2123 | 2124 | Same |
+| Dedup suppressed | — | 1,032 | — |
+
+### False Positive Deep Dive
+
+Of 330 false positive bibs (emitted but not in ground truth):
+- **323 (97.9%)**: Valid race bib numbers correctly read by OCR — real racers not in GT (spectators, non-finishers, pre-race warm-up passes)
+- **7 (2.1%)**: True OCR hallucinations — all single-character substitutions (e.g., 802 for 807, 946 for 916)
+- **Confidence is NOT discriminative**: Both TP and FP have mean confidence ~0.99
+
+### Key Insight
+**OCR accuracy is not the bottleneck.** The pipeline reads bibs correctly 97.9% of the time. The problems are:
+1. **Missing finishers** (322/480 = 67% never emitted): YOLO + pose detection + tracking simply doesn't detect two-thirds of finishers
+2. **Scene control**: Every person track emits a crossing, including spectators, non-finishers, and approach passes
+3. **Person track fragmentation**: 2124 tracks for ~480 finishers (4.4x)
+
+### Next Steps
+- **Model improvements**: Better bib detection recall (YOLO training data augmentation for head-on angles)
+- **Spatial filtering**: Use Y-position range to limit crossings to actual finish zone
+- **Bib whitelist enforcement**: Reject non-bib-set emissions (eliminates all 7 hallucinations, zero TP cost)
+
+---
+
 ## 2026-02-16: Zone-Based Crossing Detection (Runs 7-8)
 
 ### Problem
@@ -996,3 +1036,5 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | E013 | 2026-02-14 | 1.4 | Pipeline perf fixes (batch OCR, pruning) | Full video, no crash, 36fps sparse | Dead track pruning fixes OOM crash |
 | E014 | 2026-02-14 | 1.4 | Giants 5K ground truth comparison | 7.7% bib recall, 44% precision | Crossing detection is the bottleneck, not OCR |
 | E015 | 2026-02-15 | 1.4 | TensorRT YOLO + OCR skip benchmark | 1.5x faster, 34 correct bibs (same) | OCR still bottleneck at 38ms PyTorch |
+| E016 | 2026-02-16 | 1.4 | Zone crossing Runs 7-8 | 28.5% recall, 30.6% precision | Zone mode, min_frames=30, cap=3 |
+| E017 | 2026-02-16 | 1.4 | Deferred emission Run 9 | 32.9% recall, 32.4% precision | Only 7/330 FP are OCR errors; rest are real bibs |
