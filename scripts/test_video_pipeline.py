@@ -1034,26 +1034,21 @@ def process_video(
             # Tracks that spent time near the timing line
             # "Near" = chest position within 15% of frame dimension from line
             n_near_line = 0
-            for d in person_track_diag.values():
-                fc = d["first_chest"]
-                lc = d.get("last_chest", fc)
-                # Check if either first or last chest was near timing line
-                # For vertical line at x=TL: check x proximity
-                # For horizontal line at y=TL: check y proximity
-                tl = timing_line
-                # Use line midpoint and orientation
-                if abs(tl.x2 - tl.x1) > abs(tl.y2 - tl.y1):
-                    # Horizontal line — check y proximity
-                    line_y = (tl.y1 + tl.y2) / 2.0 * height
-                    threshold = 0.15 * height
-                    if (abs(fc[1] - line_y) < threshold or abs(lc[1] - line_y) < threshold):
-                        n_near_line += 1
-                else:
-                    # Vertical line — check x proximity
-                    line_x = (tl.x1 + tl.x2) / 2.0 * width
-                    threshold = 0.15 * width
-                    if (abs(fc[0] - line_x) < threshold or abs(lc[0] - line_x) < threshold):
-                        n_near_line += 1
+            if timing_line is not None:
+                for d in person_track_diag.values():
+                    fc = d["first_chest"]
+                    lc = d.get("last_chest", fc)
+                    tl = timing_line
+                    if abs(tl.x2 - tl.x1) > abs(tl.y2 - tl.y1):
+                        line_y = (tl.y1 + tl.y2) / 2.0 * height
+                        threshold = 0.15 * height
+                        if (abs(fc[1] - line_y) < threshold or abs(lc[1] - line_y) < threshold):
+                            n_near_line += 1
+                    else:
+                        line_x = (tl.x1 + tl.x2) / 2.0 * width
+                        threshold = 0.15 * width
+                        if (abs(fc[0] - line_x) < threshold or abs(lc[0] - line_x) < threshold):
+                            n_near_line += 1
 
             # Track lifespan stats
             lifespans = [d["frames_seen"] for d in person_track_diag.values()]
