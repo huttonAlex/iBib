@@ -367,7 +367,10 @@ def process_video(
 
     # Zone-based crossing: track which person tracks have already fired
     person_track_emitted: set = set()  # track IDs that have emitted a crossing
-    ZONE_MIN_FRAMES = 30  # minimum frames (~1s at 30fps) before emitting
+    ZONE_MIN_FRAMES = 5  # minimum frames to filter noise tracks
+    # Deferred emission: tracks that are ready but waiting for bib identification
+    person_track_ready: set = set()  # tracks past ZONE_MIN_FRAMES, awaiting bib or death
+    prev_person_tracked_ids: set = set()  # track IDs from previous frame
 
     # Enable crossing detection for either timing-line mode or zone mode
     enable_crossings = timing_line_coords is not None or crossing_mode == "zone"
@@ -723,109 +726,136 @@ def process_video(
                 diag["frames_seen"] += 1
 
             # Check each person for crossing
-            for pid, (p_centroid, p_bbox) in person_tracked.items():
-                # Determine if this person triggers a crossing event
-                crossing_fired = False
-                if crossing_mode == "zone":
-                    # Zone mode: fire once per track after minimum age
-                    if pid not in person_track_emitted:
+            # Collect which tracks to emit this frame
+            tracks_to_emit: List[Tuple[int, Tuple[float, float], Tuple[int, int, int, int]]] = []
+
+            if crossing_mode == "zone":
+                current_ids = set(person_tracked.keys())
+
+                # Mark tracks as ready once they reach minimum age
+                for pid in current_ids:
+                    if pid not in person_track_emitted and pid not in person_track_ready:
                         diag = person_track_diag.get(pid)
                         if diag and diag["frames_seen"] >= ZONE_MIN_FRAMES:
-                            crossing_fired = True
-                            person_track_emitted.add(pid)
-                else:
-                    # Line mode: use timing line crossing detector
+                            person_track_ready.add(pid)
+
+                # Deferred emission: emit ready tracks when bib found
+                for pid in list(person_track_ready):
+                    if pid in person_track_emitted:
+                        continue
+                    bib = person_bib_assoc.get_bib(pid)
+                    if bib is not None and pid in current_ids:
+                        # Bib identified — emit now
+                        p_centroid, p_bbox = person_tracked[pid]
+                        tracks_to_emit.append((pid, p_centroid, p_bbox))
+
+                # Deferred emission: emit on track death (disappeared)
+                disappeared = (prev_person_tracked_ids - current_ids)
+                for pid in disappeared:
+                    if pid in person_track_ready and pid not in person_track_emitted:
+                        # Track died — emit with whatever we have
+                        diag = person_track_diag.get(pid)
+                        if diag:
+                            lc = diag.get("last_chest", diag["first_chest"])
+                            # Use last known position
+                            tracks_to_emit.append((pid, lc, (0, 0, 0, 0)))
+
+                prev_person_tracked_ids = current_ids.copy()
+            else:
+                # Line mode: use timing line crossing detector
+                for pid, (p_centroid, p_bbox) in person_tracked.items():
                     cx_norm = p_centroid[0] / width
                     cy_norm = p_centroid[1] / height
-                    crossing_fired = crossing_detector.check(
-                        pid, cx_norm, cy_norm, frame_idx
-                    )
+                    if crossing_detector.check(pid, cx_norm, cy_norm, frame_idx):
+                        tracks_to_emit.append((pid, p_centroid, p_bbox))
 
-                if crossing_fired:
-                    # Diagnostic: mark track as crossed
-                    if pid in person_track_diag:
-                        person_track_diag[pid]["crossed"] = True
+            for pid, p_centroid, p_bbox in tracks_to_emit:
+                if pid in person_track_emitted:
+                    continue
+                person_track_emitted.add(pid)
 
-                    bib_number = person_bib_assoc.get_bib(pid) or "UNKNOWN"
-                    confidence = person_bib_assoc.get_bib_confidence(pid)
+                # Diagnostic: mark track as crossed
+                if pid in person_track_diag:
+                    person_track_diag[pid]["crossed"] = True
 
-                    # Last-chance bib lookup: if UNKNOWN, scan tracked bibs
-                    # for any whose center is inside/near this person's bbox.
-                    # Also scan historical consensus (dead bib tracks) for bibs
-                    # whose last-known position was near this person.
-                    if bib_number == "UNKNOWN":
-                        px1, py1, px2, py2 = p_bbox
-                        margin = max(50, int(0.15 * (px2 - px1)))
-                        best_bib = None
-                        best_conf = 0.0
+                bib_number = person_bib_assoc.get_bib(pid) or "UNKNOWN"
+                confidence = person_bib_assoc.get_bib_confidence(pid)
 
-                        # Check current tracked bibs (tight match: inside bbox)
+                # Last-chance bib lookup: if UNKNOWN, scan tracked bibs
+                # for any whose center is inside/near this person's bbox.
+                if bib_number == "UNKNOWN":
+                    px1, py1, px2, py2 = p_bbox
+                    margin = max(50, int(0.15 * (px2 - px1)))
+                    best_bib = None
+                    best_conf = 0.0
+
+                    # Check current tracked bibs (tight match: inside bbox)
+                    for bid, (b_centroid, b_bbox) in tracked.items():
+                        bcx, bcy = b_centroid
+                        if px1 <= bcx <= px2 and py1 <= bcy <= py2:
+                            if bid in final_consensus:
+                                fc_number, fc_conf, fc_level = final_consensus[bid]
+                                if fc_level in ("high", "medium") and fc_conf > best_conf:
+                                    best_bib = fc_number
+                                    best_conf = fc_conf
+
+                    # Check current tracked bibs (wider margin)
+                    if best_bib is None:
                         for bid, (b_centroid, b_bbox) in tracked.items():
                             bcx, bcy = b_centroid
-                            if px1 <= bcx <= px2 and py1 <= bcy <= py2:
+                            if (px1 - margin) <= bcx <= (px2 + margin) and py1 <= bcy <= py2:
                                 if bid in final_consensus:
                                     fc_number, fc_conf, fc_level = final_consensus[bid]
-                                    if fc_level in ("high", "medium") and fc_conf > best_conf:
+                                    if fc_level == "high" and fc_conf > best_conf:
                                         best_bib = fc_number
                                         best_conf = fc_conf
 
-                        # Check current tracked bibs (wider margin)
-                        if best_bib is None:
-                            for bid, (b_centroid, b_bbox) in tracked.items():
-                                bcx, bcy = b_centroid
-                                if (px1 - margin) <= bcx <= (px2 + margin) and py1 <= bcy <= py2:
-                                    if bid in final_consensus:
-                                        fc_number, fc_conf, fc_level = final_consensus[bid]
-                                        if fc_level == "high" and fc_conf > best_conf:
-                                            best_bib = fc_number
-                                            best_conf = fc_conf
+                    if best_bib is not None:
+                        bib_number = best_bib
+                        confidence = best_conf
 
-                        if best_bib is not None:
-                            bib_number = best_bib
-                            confidence = best_conf
+                # Short fragment suppression: demote low-conf short bibs
+                # unless the bib is a known-valid number in the bib set.
+                _crossing_bib_valid = (
+                    bib_validator is not None
+                    and bib_number in bib_validator.bib_set
+                )
+                if bib_number != "UNKNOWN" and not _crossing_bib_valid:
+                    if len(bib_number) == 1 and confidence < 0.95:
+                        bib_number = "UNKNOWN"
+                        confidence = 0.0
+                    elif len(bib_number) == 2 and confidence < 0.90:
+                        bib_number = "UNKNOWN"
+                        confidence = 0.0
 
-                    # Short fragment suppression: demote low-conf short bibs
-                    # unless the bib is a known-valid number in the bib set.
-                    _crossing_bib_valid = (
-                        bib_validator is not None
-                        and bib_number in bib_validator.bib_set
-                    )
-                    if bib_number != "UNKNOWN" and not _crossing_bib_valid:
-                        if len(bib_number) == 1 and confidence < 0.95:
-                            bib_number = "UNKNOWN"
-                            confidence = 0.0
-                        elif len(bib_number) == 2 and confidence < 0.90:
-                            bib_number = "UNKNOWN"
-                            confidence = 0.0
+                # Bib-level dedup (with escalating confidence)
+                if not bib_dedup.should_emit(
+                    bib_number, frame_idx, confidence, track_id=pid
+                ):
+                    dedup_suppressed += 1
+                    continue
 
-                    # Bib-level dedup (with escalating confidence)
-                    if not bib_dedup.should_emit(
-                        bib_number, frame_idx, confidence, track_id=pid
-                    ):
-                        dedup_suppressed += 1
-                        continue
-
-                    crossing_seq += 1
-                    event = CrossingEvent(
-                        sequence=crossing_seq,
-                        frame_idx=frame_idx,
-                        timestamp_sec=time_sec,
-                        person_track_id=pid,
-                        bib_number=bib_number,
-                        confidence=confidence,
-                        person_bbox=p_bbox,
-                        chest_point=p_centroid,
-                        source="pose",
-                    )
-                    crossing_log.write(event)
-                    total_crossings += 1
-                    if bib_number == "UNKNOWN":
-                        unknown_crossings += 1
-                    else:
-                        crossing_bib_found += 1
-                    # Diagnostic: record bib for track
-                    if pid in person_track_diag and bib_number != "UNKNOWN":
-                        person_track_diag[pid]["bib"] = bib_number
+                crossing_seq += 1
+                event = CrossingEvent(
+                    sequence=crossing_seq,
+                    frame_idx=frame_idx,
+                    timestamp_sec=time_sec,
+                    person_track_id=pid,
+                    bib_number=bib_number,
+                    confidence=confidence,
+                    person_bbox=p_bbox,
+                    chest_point=p_centroid,
+                    source="pose",
+                )
+                crossing_log.write(event)
+                total_crossings += 1
+                if bib_number == "UNKNOWN":
+                    unknown_crossings += 1
+                else:
+                    crossing_bib_found += 1
+                # Diagnostic: record bib for track
+                if pid in person_track_diag and bib_number != "UNKNOWN":
+                    person_track_diag[pid]["bib"] = bib_number
 
             # Cleanup stale state
             if crossing_detector is not None:
