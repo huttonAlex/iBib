@@ -217,6 +217,7 @@ def process_video(
     stride: int = 1,
     start_time: float = 0.0,
     enable_ocr_skip: bool = True,
+    crossing_mode: str = "line",
 ):
     """Process video with bib detection + OCR + Tier 1+2 improvements."""
 
@@ -359,21 +360,34 @@ def process_video(
     crossing_bib_found = 0  # crossings where a bib was successfully associated
     crossing_unknown_pre_dedup = 0  # crossings that were UNKNOWN before dedup
 
-    if timing_line_coords is not None:
-        timing_line = TimingLine(*timing_line_coords)
-        debounce_frames = int(debounce_time * fps)
-        crossing_detector = CrossingDetector(
-            timing_line=timing_line,
-            direction=crossing_direction,
-            debounce_frames=debounce_frames,
-        )
-        print(f"Timing line: {timing_line_coords}, direction={crossing_direction}")
-        print(f"Debounce: {debounce_time}s ({debounce_frames} frames)")
+    # Zone-based crossing: track which person tracks have already fired
+    person_track_emitted: set = set()  # track IDs that have emitted a crossing
+    ZONE_MIN_FRAMES = 5  # minimum frames a track must exist before emitting
+
+    # Enable crossing detection for either timing-line mode or zone mode
+    enable_crossings = timing_line_coords is not None or crossing_mode == "zone"
+
+    if enable_crossings:
+        if timing_line_coords is not None:
+            timing_line = TimingLine(*timing_line_coords)
+            debounce_frames = int(debounce_time * fps)
+            crossing_detector = CrossingDetector(
+                timing_line=timing_line,
+                direction=crossing_direction,
+                debounce_frames=debounce_frames,
+            )
+            print(f"Timing line: {timing_line_coords}, direction={crossing_direction}")
+            print(f"Debounce: {debounce_time}s ({debounce_frames} frames)")
+
+        if crossing_mode == "zone":
+            print(f"Crossing mode: ZONE (emit once per person track after {ZONE_MIN_FRAMES} frames)")
+        else:
+            print(f"Crossing mode: LINE")
 
         # Bib-level deduplication (10s worth of frames)
         bib_dedup = BibCrossingDeduplicator(debounce_frames=int(10.0 * fps))
 
-        if enable_person_detect:
+        if enable_person_detect or crossing_mode == "zone":
             pose_detector = PoseDetector(
                 model_path=pose_model_path,
                 conf=0.5,
@@ -682,12 +696,26 @@ def process_video(
                 diag["last_chest"] = (p_centroid[0], p_centroid[1])
                 diag["frames_seen"] += 1
 
-            # Check each person for crossing (using chest point)
+            # Check each person for crossing
             for pid, (p_centroid, p_bbox) in person_tracked.items():
-                cx_norm = p_centroid[0] / width
-                cy_norm = p_centroid[1] / height
+                # Determine if this person triggers a crossing event
+                crossing_fired = False
+                if crossing_mode == "zone":
+                    # Zone mode: fire once per track after minimum age
+                    if pid not in person_track_emitted:
+                        diag = person_track_diag.get(pid)
+                        if diag and diag["frames_seen"] >= ZONE_MIN_FRAMES:
+                            crossing_fired = True
+                            person_track_emitted.add(pid)
+                else:
+                    # Line mode: use timing line crossing detector
+                    cx_norm = p_centroid[0] / width
+                    cy_norm = p_centroid[1] / height
+                    crossing_fired = crossing_detector.check(
+                        pid, cx_norm, cy_norm, frame_idx
+                    )
 
-                if crossing_detector.check(pid, cx_norm, cy_norm, frame_idx):
+                if crossing_fired:
                     # Diagnostic: mark track as crossed
                     if pid in person_track_diag:
                         person_track_diag[pid]["crossed"] = True
@@ -769,7 +797,8 @@ def process_video(
                         person_track_diag[pid]["bib"] = bib_number
 
             # Cleanup stale state
-            crossing_detector.cleanup(set(person_tracked.keys()))
+            if crossing_detector is not None:
+                crossing_detector.cleanup(set(person_tracked.keys()))
             person_bib_assoc.cleanup(frame_idx)
 
             # Draw person bboxes (cyan) + chest points (magenta dots)
@@ -1098,6 +1127,15 @@ def main():
         help="Minimum seconds between crossings for the same track (default: 2.0)",
     )
     parser.add_argument(
+        "--crossing-mode",
+        type=str,
+        default="line",
+        choices=["line", "zone"],
+        help="Crossing detection mode: 'line' = timing line crossing (requires --timing-line), "
+             "'zone' = emit once per person track after minimum age (for head-on cameras). "
+             "(default: line)",
+    )
+    parser.add_argument(
         "--no-person-detect",
         action="store_true",
         help="Disable person detection (use bib tracker for crossings instead)",
@@ -1243,6 +1281,7 @@ def main():
         stride=args.stride,
         start_time=args.start_time,
         enable_ocr_skip=not args.no_ocr_skip,
+        crossing_mode=args.crossing_mode,
     )
 
     print("\nDone!")
