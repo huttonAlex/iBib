@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 log = logging.getLogger(__name__)
 
@@ -115,16 +116,13 @@ class CentroidTracker:
                 for j, ic in enumerate(input_centroids):
                     D[i, j] = np.sqrt((oc[0] - ic[0]) ** 2 + (oc[1] - ic[1]) ** 2)
 
-            # Match using greedy approach
-            rows = D.min(axis=1).argsort()
-            cols = D.argmin(axis=1)[rows]
+            # Optimal assignment via the Hungarian algorithm
+            row_indices, col_indices = linear_sum_assignment(D)
 
             used_rows = set()
             used_cols = set()
 
-            for row, col in zip(rows, cols):
-                if row in used_rows or col in used_cols:
-                    continue
+            for row, col in zip(row_indices, col_indices):
                 if D[row, col] > self.max_distance:
                     continue
 
@@ -372,7 +370,16 @@ class CrossingDetector:
         """
         side = self.timing_line.side_of_point(cx_norm, cy_norm)
         if side == 0:
-            return False
+            # On the line: inherit current context to avoid stalling hysteresis.
+            pending = self._pending.get(track_id)
+            if pending is not None:
+                side = pending[0]  # continue building toward pending side
+            else:
+                prev_side = self._prev_side.get(track_id)
+                if prev_side is not None:
+                    side = prev_side  # stay on confirmed side
+                else:
+                    return False  # first observation, no side to inherit
 
         prev = self._prev_side.get(track_id)
 
@@ -513,6 +520,8 @@ class PersistentPersonBibAssociator:
             final_consensus: {bid: (number, conf, level)} from OCR voting.
             frame_idx: Current frame number.
         """
+        # Pass 1: find each person's best bib candidate
+        pid_best: Dict[int, Tuple[int, float]] = {}  # pid -> (bid, dist)
         for pid, (p_centroid, p_bbox) in person_tracked.items():
             self._last_seen[pid] = frame_idx
             px1, py1, px2, py2 = p_bbox
@@ -533,8 +542,24 @@ class PersistentPersonBibAssociator:
                     best_dist = dist
                     best_bid = bid
 
-            if best_bid is not None and best_bid in final_consensus:
-                bib_number, conf, level = final_consensus[best_bid]
+            if best_bid is not None:
+                pid_best[pid] = (best_bid, best_dist)
+
+        # Pass 2: enforce exclusive bib assignment (closest person wins)
+        bid_to_pids: Dict[int, List[Tuple[int, float]]] = {}
+        for pid, (bid, dist) in pid_best.items():
+            bid_to_pids.setdefault(bid, []).append((pid, dist))
+
+        winners: Dict[int, int] = {}  # pid -> bid
+        for bid, pid_list in bid_to_pids.items():
+            # Closest person gets this bib
+            best_pid = min(pid_list, key=lambda x: x[1])[0]
+            winners[best_pid] = bid
+
+        # Cast votes only for winners
+        for pid, bid in winners.items():
+            if bid in final_consensus:
+                bib_number, conf, level = final_consensus[bid]
                 weight = self._vote_weight(bib_number, level)
                 if weight > 0:
                     if pid not in self._votes:

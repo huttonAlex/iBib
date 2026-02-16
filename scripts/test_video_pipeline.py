@@ -334,8 +334,10 @@ def process_video(
     cleanup_modified = 0
     ocr_skip_count = 0
 
-    # Track final consensus per track (pruned each frame to active tracks only)
+    # Track final consensus per track (pruned when stale)
     final_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
+    final_consensus_frame: Dict[int, int] = {}  # track_id -> last frame_idx updated
+    consensus_ttl = int(5 * fps)  # prune entries dead longer than 5 seconds
     # All-time best consensus per track for summary stats (never pruned)
     all_consensus: Dict[int, Tuple[str, float, str]] = {}  # track_id -> (number, conf, level)
 
@@ -429,8 +431,8 @@ def process_video(
         if not ret:
             break
 
-        frame_idx += 1
         time_sec = frame_idx / fps
+        frame_idx += 1
 
         # Skip frames based on stride (still count for correct timestamps)
         if stride > 1 and frame_idx % stride != 0:
@@ -589,6 +591,7 @@ def process_video(
                 classified.adjusted_confidence,
                 classified.level.value,
             )
+            final_consensus_frame[track_id] = frame_idx
             all_consensus[track_id] = final_consensus[track_id]
 
             # Add to review queue if needed
@@ -861,12 +864,19 @@ def process_video(
             cv2.line(frame, pt1, pt2, (255, 0, 255), 2)
 
         # Prune dead tracks from voting history to prevent memory leak.
-        # Keep final_consensus entries — they're lightweight and needed
-        # for retroactive bib-person association at crossing time.
         active_track_ids = set(tracked.keys())
         stale_voting_ids = set(voting.history.keys()) - active_track_ids
         for dead_id in stale_voting_ids:
             voting.clear_track(dead_id)
+
+        # Prune stale final_consensus entries (dead > consensus_ttl frames)
+        # to prevent ghost bib assignments from spatially overlapping old tracks.
+        for tid in list(final_consensus.keys()):
+            if tid not in active_track_ids:
+                last_update = final_consensus_frame.get(tid, 0)
+                if frame_idx - last_update > consensus_ttl:
+                    final_consensus.pop(tid, None)
+                    final_consensus_frame.pop(tid, None)
 
         # Write frame
         if out_writer:
