@@ -1,7 +1,6 @@
 """Tests for pointcam.crossing module."""
 
 import tempfile
-import warnings
 from pathlib import Path
 
 import cv2
@@ -9,15 +8,12 @@ import numpy as np
 import pytest
 
 from pointcam.crossing import (
-    BackgroundSubtractorManager,
     BibCrossingDeduplicator,
     CentroidTracker,
     CrossingDetector,
     CrossingEvent,
     CrossingEventLog,
-    MergedBlobEstimator,
     PersistentPersonBibAssociator,
-    PersonBibAssociator,
     PersonDetection,
     PoseDetector,
     TimingLine,
@@ -513,82 +509,6 @@ class TestBibCrossingDeduplicator:
         dedup = BibCrossingDeduplicator(debounce_frames=10)
         assert dedup.should_emit("1234", frame_idx=0) is True
         assert dedup.should_emit("1234", frame_idx=100) is True  # default conf=1.0 >= 0.7
-
-
-# ---------------------------------------------------------------------------
-# BackgroundSubtractorManager (deprecated)
-# ---------------------------------------------------------------------------
-
-
-class TestBackgroundSubtractorManager:
-    def test_deprecation_warning(self):
-        """Constructing emits a DeprecationWarning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            BackgroundSubtractorManager(min_area=100)
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-            assert "deprecated" in str(w[0].message).lower()
-
-    def test_returns_list_of_bboxes(self):
-        """process() returns a list of bounding box tuples."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            mgr = BackgroundSubtractorManager(min_area=100)
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        result = mgr.process(frame)
-        assert isinstance(result, list)
-
-
-# ---------------------------------------------------------------------------
-# PersonBibAssociator (deprecated)
-# ---------------------------------------------------------------------------
-
-
-class TestPersonBibAssociator:
-    def test_deprecation_warning(self):
-        """Constructing emits a DeprecationWarning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            PersonBibAssociator(max_distance=200)
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-
-    def test_bib_inside_person_bbox(self):
-        """A bib whose center is inside a person bbox gets matched."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            assoc = PersonBibAssociator(max_distance=200)
-        persons = {
-            1: ((250.0, 300.0), (200, 100, 300, 500)),
-        }
-        bibs = {
-            10: ((250.0, 250.0), (230, 230, 270, 270)),  # inside person 1
-        }
-        result = assoc.associate(persons, bibs)
-        assert result[1] == 10
-
-
-# ---------------------------------------------------------------------------
-# MergedBlobEstimator (deprecated)
-# ---------------------------------------------------------------------------
-
-
-class TestMergedBlobEstimator:
-    def test_deprecation_warning(self):
-        """Constructing emits a DeprecationWarning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            MergedBlobEstimator(typical_person_area=10000)
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-
-    def test_single_person(self):
-        """A blob with typical area returns 1."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            est = MergedBlobEstimator(typical_person_area=10000)
-        assert est.estimate((0, 0, 100, 100)) == 1  # 10000 area
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,7 @@
 """Person detection and timing-line crossing detection.
 
 YOLOv8n-pose for person detection (chest keypoint crossing) with persistent
-bib association and bib-level deduplication.  Legacy MOG2 blob approach kept
-but deprecated.
+bib association and bib-level deduplication.
 
 Classes:
     CentroidTracker              - Simple centroid-based object tracker
@@ -14,16 +13,12 @@ Classes:
     BibCrossingDeduplicator      - Prevents same bib from firing twice
     CrossingEvent                - Dataclass for a single crossing event
     CrossingEventLog             - Writes crossing events to CSV
-    BackgroundSubtractorManager  - (deprecated) MOG2 + morphological cleanup
-    PersonBibAssociator          - (deprecated) Stateless spatial matching
-    MergedBlobEstimator          - (deprecated) Area-based person count
 """
 
 from __future__ import annotations
 
 import csv
 import logging
-import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -705,218 +700,6 @@ class BibCrossingDeduplicator:
         if track_id is not None:
             self._track_bib_emitted.add((track_id, bib_number))
         return True
-
-
-# ---------------------------------------------------------------------------
-# BackgroundSubtractorManager (deprecated)
-# ---------------------------------------------------------------------------
-
-
-class BackgroundSubtractorManager:
-    """Wraps MOG2 background subtraction + morphological cleanup.
-
-    .. deprecated::
-        Use :class:`PoseDetector` for person detection instead.  MOG2 produces
-        noisy results with merged blobs.
-
-    Extracts person-sized blobs filtered by area and aspect ratio.
-
-    Args:
-        history: Number of frames for background model.
-        var_threshold: Variance threshold for MOG2.
-        detect_shadows: Whether MOG2 should detect shadows.
-        min_area: Minimum contour area in pixels to be considered a person.
-        max_area: Maximum contour area in pixels.
-        min_aspect_ratio: Minimum height/width ratio (persons are tall).
-        max_aspect_ratio: Maximum height/width ratio.
-        morph_kernel_size: Kernel size for morphological operations.
-    """
-
-    def __init__(
-        self,
-        history: int = 500,
-        var_threshold: float = 50.0,
-        detect_shadows: bool = True,
-        min_area: int = 2000,
-        max_area: int = 200000,
-        min_aspect_ratio: float = 0.5,
-        max_aspect_ratio: float = 5.0,
-        morph_kernel_size: int = 5,
-    ):
-        warnings.warn(
-            "BackgroundSubtractorManager is deprecated. Use PoseDetector instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=history,
-            varThreshold=var_threshold,
-            detectShadows=detect_shadows,
-        )
-        self.min_area = min_area
-        self.max_area = max_area
-        self.min_aspect_ratio = min_aspect_ratio
-        self.max_aspect_ratio = max_aspect_ratio
-        self.kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (morph_kernel_size, morph_kernel_size)
-        )
-
-    def process(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Apply background subtraction and return person-sized bounding boxes.
-
-        Args:
-            frame: BGR frame from video capture.
-
-        Returns:
-            List of (x1, y1, x2, y2) bounding boxes for detected blobs.
-        """
-        fg_mask = self.bg_subtractor.apply(frame)
-
-        # Threshold: remove shadows (value 127 in MOG2), keep foreground (255)
-        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-
-        # Morphological cleanup: close gaps, then open to remove noise
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, self.kernel, iterations=2)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel, iterations=1)
-
-        # Find contours
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        bboxes = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area or area > self.max_area:
-                continue
-
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w == 0:
-                continue
-            aspect = h / w
-
-            if aspect < self.min_aspect_ratio or aspect > self.max_aspect_ratio:
-                continue
-
-            bboxes.append((x, y, x + w, y + h))
-
-        return bboxes
-
-
-# ---------------------------------------------------------------------------
-# PersonBibAssociator (deprecated)
-# ---------------------------------------------------------------------------
-
-
-class PersonBibAssociator:
-    """Matches person blobs to bib detections by spatial proximity.
-
-    .. deprecated::
-        Use :class:`PersistentPersonBibAssociator` for persistent association
-        with temporal voting.
-
-    A bib is associated with a person if the bib center falls inside the
-    person bounding box, or if it is the closest person within a distance
-    threshold.
-
-    Args:
-        max_distance: Maximum pixel distance for fallback association when
-            the bib center is not inside any person bbox.
-    """
-
-    def __init__(self, max_distance: float = 150.0):
-        warnings.warn(
-            "PersonBibAssociator is deprecated. Use PersistentPersonBibAssociator instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.max_distance = max_distance
-
-    def associate(
-        self,
-        person_bboxes: Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]],
-        bib_bboxes: Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]],
-    ) -> Dict[int, Optional[int]]:
-        """Associate person track IDs with bib track IDs.
-
-        Args:
-            person_bboxes: {person_track_id: (centroid, (x1,y1,x2,y2))}.
-            bib_bboxes: {bib_track_id: (centroid, (x1,y1,x2,y2))}.
-
-        Returns:
-            Dict mapping person_track_id -> bib_track_id (or None if unmatched).
-        """
-        result: Dict[int, Optional[int]] = {}
-        used_bibs: set = set()
-
-        for pid, (p_centroid, p_bbox) in person_bboxes.items():
-            px1, py1, px2, py2 = p_bbox
-            best_bib_id: Optional[int] = None
-            best_dist = float("inf")
-
-            for bid, (b_centroid, b_bbox) in bib_bboxes.items():
-                if bid in used_bibs:
-                    continue
-                bcx, bcy = b_centroid
-
-                # Prefer: bib center inside person bbox
-                inside = px1 <= bcx <= px2 and py1 <= bcy <= py2
-                dist = np.sqrt(
-                    (p_centroid[0] - bcx) ** 2 + (p_centroid[1] - bcy) ** 2
-                )
-
-                if inside:
-                    # Among bibs inside, pick closest
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_bib_id = bid
-                elif best_bib_id is None and dist < self.max_distance and dist < best_dist:
-                    # Fallback: closest bib within distance
-                    best_dist = dist
-                    best_bib_id = bid
-
-            result[pid] = best_bib_id
-            if best_bib_id is not None:
-                used_bibs.add(best_bib_id)
-
-        return result
-
-
-# ---------------------------------------------------------------------------
-# MergedBlobEstimator (deprecated)
-# ---------------------------------------------------------------------------
-
-
-class MergedBlobEstimator:
-    """Estimates the number of persons in a merged (large) blob.
-
-    .. deprecated::
-        Use :class:`PoseDetector` which detects individual persons without
-        merging.
-
-    Uses a simple area heuristic: estimated_count = blob_area / typical_person_area.
-
-    Args:
-        typical_person_area: Expected area of a single person in pixels.
-            Depends on camera distance/resolution.  A reasonable default
-            for 1080p finish-line footage is ~8000-15000 px.
-    """
-
-    def __init__(self, typical_person_area: float = 10000.0):
-        warnings.warn(
-            "MergedBlobEstimator is deprecated. Use PoseDetector instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self.typical_person_area = typical_person_area
-
-    def estimate(self, bbox: Tuple[int, int, int, int]) -> int:
-        """Estimate the number of persons in a bounding box.
-
-        Returns at least 1.
-        """
-        x1, y1, x2, y2 = bbox
-        area = (x2 - x1) * (y2 - y1)
-        count = max(1, round(area / self.typical_person_area))
-        return count
 
 
 # ---------------------------------------------------------------------------

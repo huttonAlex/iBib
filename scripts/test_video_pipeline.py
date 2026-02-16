@@ -115,13 +115,16 @@ class PARSeqOCR:
         if not crops_bgr:
             return []
 
-        tensors = []
+        # Vectorized preprocessing: BGR→RGB, resize, normalize via numpy/cv2
+        # (avoids per-crop PIL roundtrip and torchvision overhead)
+        preprocessed = []
         for crop in crops_bgr:
             rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-            tensors.append(self.transform(pil_img))
+            resized = cv2.resize(rgb, (128, 32), interpolation=cv2.INTER_CUBIC)
+            t = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
+            preprocessed.append((t - 0.5) / 0.5)
 
-        batch = torch.stack(tensors).to(self.device)
+        batch = torch.from_numpy(np.stack(preprocessed)).to(self.device)
 
         with torch.no_grad():
             logits = self.model(batch)
