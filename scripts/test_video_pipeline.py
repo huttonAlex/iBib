@@ -352,6 +352,13 @@ def process_video(
     dedup_suppressed = 0
     total_pose_time = 0.0
 
+    # --- Diagnostic: person track lifecycle tracking ---
+    # track_id -> {first_frame, last_frame, first_chest, last_chest, frames_seen, crossed, bib}
+    person_track_diag: Dict[int, dict] = {}
+    total_person_dets = 0  # total person detections across all frames
+    crossing_bib_found = 0  # crossings where a bib was successfully associated
+    crossing_unknown_pre_dedup = 0  # crossings that were UNKNOWN before dedup
+
     if timing_line_coords is not None:
         timing_line = TimingLine(*timing_line_coords)
         debounce_frames = int(debounce_time * fps)
@@ -650,6 +657,7 @@ def process_video(
             person_dets = pose_detector.detect(frame)
             t_pose_end = time.perf_counter()
             total_pose_time += t_pose_end - t_pose_start
+            total_person_dets += len(person_dets)
 
             # Update person tracker using chest points as centroids
             p_bboxes = [d.bbox for d in person_dets]
@@ -659,12 +667,31 @@ def process_video(
             # Accumulate person→bib associations via voting
             person_bib_assoc.update(person_tracked, tracked, final_consensus, frame_idx)
 
+            # Diagnostic: track person lifecycle
+            for pid, (p_centroid, p_bbox) in person_tracked.items():
+                if pid not in person_track_diag:
+                    person_track_diag[pid] = {
+                        "first_frame": frame_idx,
+                        "first_chest": (p_centroid[0], p_centroid[1]),
+                        "frames_seen": 0,
+                        "crossed": False,
+                        "bib": None,
+                    }
+                diag = person_track_diag[pid]
+                diag["last_frame"] = frame_idx
+                diag["last_chest"] = (p_centroid[0], p_centroid[1])
+                diag["frames_seen"] += 1
+
             # Check each person for crossing (using chest point)
             for pid, (p_centroid, p_bbox) in person_tracked.items():
                 cx_norm = p_centroid[0] / width
                 cy_norm = p_centroid[1] / height
 
                 if crossing_detector.check(pid, cx_norm, cy_norm, frame_idx):
+                    # Diagnostic: mark track as crossed
+                    if pid in person_track_diag:
+                        person_track_diag[pid]["crossed"] = True
+
                     bib_number = person_bib_assoc.get_bib(pid) or "UNKNOWN"
                     confidence = person_bib_assoc.get_bib_confidence(pid)
 
@@ -735,6 +762,11 @@ def process_video(
                     total_crossings += 1
                     if bib_number == "UNKNOWN":
                         unknown_crossings += 1
+                    else:
+                        crossing_bib_found += 1
+                    # Diagnostic: record bib for track
+                    if pid in person_track_diag and bib_number != "UNKNOWN":
+                        person_track_diag[pid]["bib"] = bib_number
 
             # Cleanup stale state
             crossing_detector.cleanup(set(person_tracked.keys()))
@@ -889,6 +921,81 @@ def process_video(
             print(f"  Person tracks: {person_tracker.next_id}")
         if pose_detector is not None:
             print(f"  Avg pose time: {1000 * total_pose_time / frame_idx:.1f} ms/frame")
+            print(f"  Total person detections: {total_person_dets}")
+            print(f"  Avg persons/frame: {total_person_dets / max(frame_idx, 1):.1f}")
+
+        # --- Diagnostic: Person Track Funnel ---
+        if person_track_diag:
+            n_tracks = len(person_track_diag)
+            n_crossed = sum(1 for d in person_track_diag.values() if d["crossed"])
+            n_bib = sum(1 for d in person_track_diag.values() if d["bib"] is not None)
+            # Tracks that spent time near the timing line
+            # "Near" = chest position within 15% of frame dimension from line
+            n_near_line = 0
+            for d in person_track_diag.values():
+                fc = d["first_chest"]
+                lc = d.get("last_chest", fc)
+                # Check if either first or last chest was near timing line
+                # For vertical line at x=TL: check x proximity
+                # For horizontal line at y=TL: check y proximity
+                tl = timing_line
+                # Use line midpoint and orientation
+                if abs(tl.x2 - tl.x1) > abs(tl.y2 - tl.y1):
+                    # Horizontal line — check y proximity
+                    line_y = (tl.y1 + tl.y2) / 2.0 * height
+                    threshold = 0.15 * height
+                    if (abs(fc[1] - line_y) < threshold or abs(lc[1] - line_y) < threshold):
+                        n_near_line += 1
+                else:
+                    # Vertical line — check x proximity
+                    line_x = (tl.x1 + tl.x2) / 2.0 * width
+                    threshold = 0.15 * width
+                    if (abs(fc[0] - line_x) < threshold or abs(lc[0] - line_x) < threshold):
+                        n_near_line += 1
+
+            # Track lifespan stats
+            lifespans = [d["frames_seen"] for d in person_track_diag.values()]
+            avg_life = sum(lifespans) / len(lifespans) if lifespans else 0
+            lifespans_sorted = sorted(lifespans)
+            median_life = lifespans_sorted[len(lifespans_sorted) // 2] if lifespans_sorted else 0
+
+            print(f"\n  {'='*50}")
+            print(f"  PIPELINE FUNNEL (person tracks)")
+            print(f"  {'='*50}")
+            print(f"  Total person detections:    {total_person_dets}")
+            print(f"  Unique person tracks:       {n_tracks}")
+            print(f"  Tracks near timing line:    {n_near_line} ({100*n_near_line/max(n_tracks,1):.1f}%)")
+            print(f"  Tracks that crossed:        {n_crossed} ({100*n_crossed/max(n_tracks,1):.1f}%)")
+            print(f"  Crossings with bib (pre-dup): {crossing_bib_found}")
+            print(f"  Crossings UNKNOWN (pre-dup):  {crossing_unknown_pre_dedup + unknown_crossings}")
+            print(f"  Dedup suppressed:           {dedup_suppressed}")
+            print(f"  Final emitted crossings:    {total_crossings}")
+            print(f"  {'='*50}")
+            print(f"  Track lifespan: avg={avg_life:.1f} frames, median={median_life} frames")
+            short_tracks = sum(1 for l in lifespans if l <= 3)
+            print(f"  Tracks ≤3 frames:           {short_tracks} ({100*short_tracks/max(n_tracks,1):.1f}%)")
+
+            # Write person track summary CSV
+            diag_path = output_dir / f"{Path(video_path).stem}_person_tracks.csv"
+            with open(diag_path, "w", newline="") as df:
+                dw = csv.writer(df)
+                dw.writerow([
+                    "track_id", "first_frame", "last_frame", "frames_seen",
+                    "first_chest_x", "first_chest_y", "last_chest_x", "last_chest_y",
+                    "crossed", "bib",
+                ])
+                for tid in sorted(person_track_diag.keys()):
+                    d = person_track_diag[tid]
+                    fc = d["first_chest"]
+                    lc = d.get("last_chest", fc)
+                    dw.writerow([
+                        tid, d["first_frame"], d.get("last_frame", d["first_frame"]),
+                        d["frames_seen"],
+                        f"{fc[0]:.1f}", f"{fc[1]:.1f}",
+                        f"{lc[0]:.1f}", f"{lc[1]:.1f}",
+                        d["crossed"], d["bib"] or "",
+                    ])
+            print(f"  Person track diag: {diag_path}")
 
     print(f"\nOutputs:")
     if write_video:
