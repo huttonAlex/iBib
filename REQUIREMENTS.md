@@ -106,14 +106,24 @@
 | PR-2.3 | Continuous operation for 8+ hours | Must |
 | PR-2.4 | Typical: 1-3 simultaneous crossings | Info |
 
-### PR-3: Reliability
+### PR-3: Accuracy
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| PR-3.1 | Target >85% detection accuracy in production | Must |
-| PR-3.2 | Zero data loss during connectivity interruptions | Must |
-| PR-3.3 | Graceful degradation under processing overload | Should |
-| PR-3.4 | Automatic recovery from transient failures | Should |
+| PR-3.1 | End-to-end bib identification accuracy ≥95% (correct bibs / GT finishers) | Must |
+| PR-3.2 | Bib precision ≥95% (correct bibs / all bibs emitted) | Must |
+| PR-3.3 | Crossing recall ≥95% (crossings detected / GT finishers) | Must |
+| PR-3.4 | False positive bibs ≤5 per race | Must |
+| PR-3.5 | UNKNOWN crossing rate ≤10% | Should |
+| PR-3.6 | Duplicate bib crossings ≤3 per race | Should |
+
+### PR-4: Reliability
+
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| PR-4.1 | Zero data loss during connectivity interruptions | Must |
+| PR-4.2 | Graceful degradation under processing overload | Should |
+| PR-4.3 | Automatic recovery from transient failures | Should |
 
 ---
 
@@ -285,26 +295,29 @@
 - [ ] Detect timing line in controlled conditions
 - [ ] Record single runner crossing with GPS-synced timestamp
 - [ ] Basic CTP01 message generation
+- [ ] End-to-end pipeline on recorded video with ≥80% bib recall
 
 ### Phase 2: Field Testing
 
-- [ ] Successfully read bibs from moving runners (>70% accuracy)
+- [ ] Successfully read bibs from moving runners (≥90% bib recall)
 - [ ] Handle multiple simultaneous crossings (3+)
 - [ ] Maintain correct position order
-- [ ] Real-time processing on selected hardware
+- [ ] Real-time processing (≥30 fps) on Jetson Orin Nano
+- [ ] Precision ≥90% (false positives ≤10)
 - [ ] Offline queue functioning
 
 ### Phase 3: Backup Deployment
 
 - [ ] Successfully operate as backup in small race (<500 people)
 - [ ] CTP01 integration with scoring software working
-- [ ] >85% detection accuracy in field conditions
+- [ ] ≥95% bib recall and ≥95% precision in field conditions
 - [ ] Zero data loss during connectivity gaps
 - [ ] Operator web interface functional
 
 ### Phase 4: Production Ready
 
 - [ ] Operate reliably in races up to 3,000 people
+- [ ] ≥95% accuracy maintained across varied conditions
 - [ ] Weather resistant operation
 - [ ] 6+ hour battery life
 - [ ] OTA update capability

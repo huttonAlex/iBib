@@ -635,6 +635,89 @@ Drawing already gated by `if write_video or show:` — `--no-video` without `--s
 **Deferred — Phase D: Threaded Pipeline**:
 On a single GPU, neural network inference is inherently serial (shared CUDA stream). Threading benefit is limited to overlapping I/O with GPU work. Only worth implementing if Phases A-C don't reach ~25-30 fps target.
 
+### Entry 2026-02-15: Accuracy Root-Cause Analysis & Improvement Roadmap
+
+**Phase/Milestone**: 1.4 - Basic Video Processing
+
+**Objective**:
+Understand why end-to-end bib accuracy is 7.1% (target: ≥95%) and map out a prioritized path to close the gap.
+
+**Context**:
+Runs 3-4 on REC-0006-A (Giants 5K, 480 finishers, head-on camera at finish line) consistently show ~34 correct bibs out of 480 (7.1% recall) and 32-44% precision. Camera placement is directly facing the timing line at bib height — this is good placement. The problem is software.
+
+**The Accuracy Chain**:
+
+Accuracy is the product of three serial stages. All three must be near-perfect to reach 95%:
+
+```
+Detection (YOLO)  ×  Association (person↔bib)  ×  OCR+Emission  =  End-to-End
+   62%            ×         ~60%               ×     ~19%       =     7.1%
+
+Target:  ≥98%     ×        ≥98%               ×     ≥99%       =    ≥95%
+```
+
+**Five Failure Modes (from analysis of first 50 GT finishers)**:
+
+| # | Failure Mode | Impact | Cause | Software Fix? |
+|---|-------------|--------|-------|--------------|
+| 1 | YOLO never detects bib | 38% of GT bibs lost | Small/distant/occluded bibs, conf threshold too high | Yes — lower threshold, larger model, more training data |
+| 2 | Detected bib not associated at crossing | 40% of detected bibs lost | 4-second association memory too short, spatial distance threshold too tight | Yes — extend memory window, widen distance |
+| 3 | Oscillation at timing line | Inflates UNKNOWN count 5-10x per lingering track | 3-frame hysteresis too lenient for keypoint jitter | Yes — increase hysteresis |
+| 4 | UNKNOWN dedup broken | All UNKNOWN crossings emitted | Per-track 2s debounce only, no location-based dedup | Yes — add spatial UNKNOWN dedup |
+| 5 | OCR fragments create false positives | 54 phantom bibs in Run 3 | "65" from "1265" is valid in bib range 1-1678 | Yes — stricter fragment rejection |
+
+**Improvement Roadmap** (prioritized by impact):
+
+**Tier 1 — Association & Crossing Architecture (biggest gap, software-only)**
+
+These fix the 40% of bibs that ARE detected but never make it to a crossing event:
+
+1. Extend association memory: 4s → 30s. Bibs detected early must persist until person crosses.
+2. Increase crossing hysteresis: 3 → 8-10 frames. Eliminates oscillation from keypoint jitter.
+3. Add spatial UNKNOWN dedup: suppress duplicate UNKNOWNs from same location within 10s.
+4. Widen association distance: 250px → 300-350px. Handles larger persons / wider camera angles.
+
+**Tier 2 — Detection Recall (38% of bibs never seen by YOLO)**
+
+Camera placement is good, so this is a model/threshold problem:
+
+5. Lower YOLO confidence threshold: 0.5 → 0.25-0.3. Accept more detections, let OCR + voting filter noise.
+6. Evaluate YOLOv8s (small) vs current YOLOv8n (nano). 3x more parameters, better small-object recall.
+7. More training data: current 127 images is small. Add video frame extractions from REC-0006-A as training data (with GT bibs as labels).
+8. Multi-scale inference: run YOLO at multiple resolutions and merge detections (trades speed for recall).
+
+**Tier 3 — OCR & False Positive Reduction**
+
+9. Stricter fragment rejection: require higher confidence for 1-2 digit bibs (0.95 for 1-digit, 0.90 for 2-digit).
+10. Dynamic short-bib penalty: only penalize low-confidence short reads, not confident ones.
+11. OCR model improvement: current PARSeq fine-tuned on 10K crops is decent (~70% on video crops) — more training data from video frames could help.
+
+**Expected Impact (cumulative)**:
+
+| After | Est. Recall | Est. Precision | Key Change |
+|-------|------------|---------------|------------|
+| Current | 7.1% | 33-44% | Baseline |
+| Tier 1 (association fixes) | 20-35% | 50-60% | Recover detected-but-unassociated bibs |
+| Tier 2 (detection recall) | 50-70% | 60-75% | See bibs that YOLO currently misses |
+| Tier 3 (OCR + FP reduction) | 55-75% | 80-90% | Reduce false positives |
+| Full pipeline maturity | 80-90% | 90-95% | Iteration, more data, tuning |
+| 95% target | ≥95% | ≥95% | May require architectural changes (see below) |
+
+**Open Questions for 95%**:
+
+Reaching 95% may require more than tuning — potential architectural changes:
+- **Re-identification**: if a bib is read at any point, bind it permanently to a person's appearance embedding (not just spatial proximity). Person re-ID survives occlusion and track fragmentation.
+- **Multi-camera**: side-angle camera catches bibs that head-on misses (turned torso, pack occlusion).
+- **Retroactive association**: after a crossing, search back through the full detection history for the best bib match to that person track, not just the real-time voting window.
+- **Higher resolution**: 4K camera at finish line significantly increases bib readability at distance.
+
+**Implications for Project**:
+- Speed optimization (TensorRT, stride) was premature — accuracy is the blocker, not speed
+- Tier 1 fixes are pure software, low effort, high impact — should be next sprint
+- Tier 2 fixes require model retraining but are well-understood
+- The 95% target is ambitious but achievable with systematic improvements
+- Current video (head-on at bib height) is good test data — failures are software, not camera
+
 ---
 
 ## Phase 2: Real-World Testing
@@ -754,12 +837,12 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 
 | Metric | Definition | Target |
 |--------|-----------|--------|
-| **Crossing recall** | Crossings detected / GT finishers | ≥80% |
-| **Bib recall** | Correct unique bibs / GT finishers | ≥70% |
-| **Precision** | Correct bibs / all unique bibs detected | ≥80% |
-| **False positive bibs** | Unique bibs not in GT | ≤10 |
-| **UNKNOWN rate** | UNKNOWN crossings / total crossings | ≤20% |
-| **Duplicate bibs** | Bibs appearing in >1 crossing | ≤5 |
+| **Crossing recall** | Crossings detected / GT finishers | ≥95% |
+| **Bib recall** | Correct unique bibs / GT finishers | ≥95% |
+| **Precision** | Correct bibs / all unique bibs detected | ≥95% |
+| **False positive bibs** | Unique bibs not in GT | ≤5 |
+| **UNKNOWN rate** | UNKNOWN crossings / total crossings | ≤10% |
+| **Duplicate bibs** | Bibs appearing in >1 crossing | ≤3 |
 
 #### Secondary Metrics
 

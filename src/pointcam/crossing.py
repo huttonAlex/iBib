@@ -339,7 +339,7 @@ class CrossingDetector:
         timing_line: TimingLine,
         direction: str = "any",
         debounce_frames: int = 60,
-        hysteresis_frames: int = 3,
+        hysteresis_frames: int = 10,
     ):
         self.timing_line = timing_line
         self.direction = direction
@@ -598,7 +598,9 @@ class BibCrossingDeduplicator:
        require progressively higher confidence — catching partial-bib misreads
        (e.g. "65" from "1265") that appear many times minutes apart.
 
-    ``"UNKNOWN"`` bibs always pass (cannot deduplicate unknowns).
+    ``"UNKNOWN"`` bibs are limited to one emission per person track.
+    Once a track has emitted an UNKNOWN crossing, all subsequent
+    UNKNOWNs from that track are suppressed.
 
     Args:
         debounce_frames: Minimum frames between crossings for the same bib.
@@ -622,6 +624,8 @@ class BibCrossingDeduplicator:
         self.escalation_thresholds = escalation_thresholds or self.DEFAULT_ESCALATION.copy()
         # track_id → last frame an UNKNOWN was emitted (for per-track dedup)
         self._track_last_crossing: Dict[int, int] = {}
+        # Track IDs that have already emitted one UNKNOWN (limit 1 per track)
+        self._track_unknown_emitted: set = set()
 
     def should_emit(
         self,
@@ -641,10 +645,11 @@ class BibCrossingDeduplicator:
         """
         if bib_number == "UNKNOWN":
             if track_id is not None:
-                last = self._track_last_crossing.get(track_id)
-                if last is not None and frame_idx - last < self.debounce_frames:
+                # Limit to 1 UNKNOWN emission per person track — subsequent
+                # UNKNOWNs from the same track are suppressed entirely.
+                if track_id in self._track_unknown_emitted:
                     return False
-                self._track_last_crossing[track_id] = frame_idx
+                self._track_unknown_emitted.add(track_id)
             return True
 
         # Frame-based debounce

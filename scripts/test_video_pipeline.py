@@ -372,7 +372,7 @@ def process_video(
                 conf=0.5,
                 device=device,
             )
-            person_tracker = CentroidTracker(max_disappeared=15, max_distance=150)
+            person_tracker = CentroidTracker(max_disappeared=45, max_distance=150)
 
             # Infer expected digit counts for short-bib penalty
             expected_digits = None
@@ -380,8 +380,8 @@ def process_video(
                 expected_digits = {len(b) for b in bib_validator.bib_set if b}
 
             person_bib_assoc = PersistentPersonBibAssociator(
-                max_distance=250,
-                memory_frames=int(4.0 * fps),  # 4 seconds
+                max_distance=350,
+                memory_frames=int(30.0 * fps),  # 30 seconds
                 min_votes=1,
                 min_confidence=0.4,
                 expected_digit_counts=expected_digits,
@@ -669,23 +669,48 @@ def process_video(
                     confidence = person_bib_assoc.get_bib_confidence(pid)
 
                     # Last-chance bib lookup: if UNKNOWN, scan tracked bibs
-                    # for any whose center is inside this person's bbox
+                    # for any whose center is inside/near this person's bbox.
+                    # Also scan historical consensus (dead bib tracks) for bibs
+                    # whose last-known position was near this person.
                     if bib_number == "UNKNOWN":
                         px1, py1, px2, py2 = p_bbox
+                        margin = max(50, int(0.15 * (px2 - px1)))
+                        best_bib = None
+                        best_conf = 0.0
+
+                        # Check current tracked bibs (tight match: inside bbox)
                         for bid, (b_centroid, b_bbox) in tracked.items():
                             bcx, bcy = b_centroid
                             if px1 <= bcx <= px2 and py1 <= bcy <= py2:
                                 if bid in final_consensus:
                                     fc_number, fc_conf, fc_level = final_consensus[bid]
-                                    if fc_level in ("high", "medium"):
-                                        bib_number = fc_number
-                                        confidence = fc_conf
-                                        break
+                                    if fc_level in ("high", "medium") and fc_conf > best_conf:
+                                        best_bib = fc_number
+                                        best_conf = fc_conf
 
-                    # Short fragment suppression: demote 1-2 digit low-conf bibs
-                    if bib_number != "UNKNOWN" and len(bib_number) <= 2 and confidence < 0.90:
-                        bib_number = "UNKNOWN"
-                        confidence = 0.0
+                        # Check current tracked bibs (wider margin)
+                        if best_bib is None:
+                            for bid, (b_centroid, b_bbox) in tracked.items():
+                                bcx, bcy = b_centroid
+                                if (px1 - margin) <= bcx <= (px2 + margin) and py1 <= bcy <= py2:
+                                    if bid in final_consensus:
+                                        fc_number, fc_conf, fc_level = final_consensus[bid]
+                                        if fc_level == "high" and fc_conf > best_conf:
+                                            best_bib = fc_number
+                                            best_conf = fc_conf
+
+                        if best_bib is not None:
+                            bib_number = best_bib
+                            confidence = best_conf
+
+                    # Short fragment suppression: demote low-conf short bibs
+                    if bib_number != "UNKNOWN":
+                        if len(bib_number) == 1 and confidence < 0.95:
+                            bib_number = "UNKNOWN"
+                            confidence = 0.0
+                        elif len(bib_number) == 2 and confidence < 0.90:
+                            bib_number = "UNKNOWN"
+                            confidence = 0.0
 
                     # Bib-level dedup (with escalating confidence)
                     if not bib_dedup.should_emit(
@@ -735,10 +760,14 @@ def process_video(
                     if track_id in final_consensus:
                         bib_number, confidence, _ = final_consensus[track_id]
 
-                    # Short fragment suppression: demote 1-2 digit low-conf bibs
-                    if bib_number != "UNKNOWN" and len(bib_number) <= 2 and confidence < 0.90:
-                        bib_number = "UNKNOWN"
-                        confidence = 0.0
+                    # Short fragment suppression: demote low-conf short bibs
+                    if bib_number != "UNKNOWN":
+                        if len(bib_number) == 1 and confidence < 0.95:
+                            bib_number = "UNKNOWN"
+                            confidence = 0.0
+                        elif len(bib_number) == 2 and confidence < 0.90:
+                            bib_number = "UNKNOWN"
+                            confidence = 0.0
 
                     # Bib-level dedup (with escalating confidence)
                     if not bib_dedup.should_emit(
@@ -770,14 +799,13 @@ def process_video(
             pt1, pt2 = timing_line.to_pixel_coords(width, height)
             cv2.line(frame, pt1, pt2, (255, 0, 255), 2)
 
-        # Prune dead tracks from voting/consensus to prevent memory leak
+        # Prune dead tracks from voting history to prevent memory leak.
+        # Keep final_consensus entries — they're lightweight and needed
+        # for retroactive bib-person association at crossing time.
         active_track_ids = set(tracked.keys())
         stale_voting_ids = set(voting.history.keys()) - active_track_ids
         for dead_id in stale_voting_ids:
             voting.clear_track(dead_id)
-        stale_consensus_ids = set(final_consensus.keys()) - active_track_ids
-        for dead_id in stale_consensus_ids:
-            del final_consensus[dead_id]
 
         # Write frame
         if out_writer:
@@ -898,7 +926,7 @@ def main():
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.5,
+        default=0.25,
         help="Detection confidence threshold",
     )
     parser.add_argument(

@@ -89,14 +89,16 @@ class TestCrossingDetector:
         assert det.check(1, 0.8, 0.5, 3) is False
 
     def test_crossing_with_default_hysteresis(self):
-        """With default hysteresis=3, need 3 frames on new side to fire."""
+        """With default hysteresis=10, need 10 frames on new side to fire."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
-        det = CrossingDetector(line, direction="any", debounce_frames=5)
+        det = CrossingDetector(line, direction="any", debounce_frames=50)
 
         det.check(1, 0.3, 0.5, 1)  # establish left
-        assert det.check(1, 0.7, 0.5, 2) is False  # 1st frame on right
-        assert det.check(1, 0.7, 0.5, 3) is False  # 2nd frame on right
-        assert det.check(1, 0.7, 0.5, 4) is True   # 3rd frame → confirmed
+        # Frames 2-10: on new side but below hysteresis threshold
+        for f in range(2, 11):
+            assert det.check(1, 0.7, 0.5, f) is False
+        # Frame 11: 10th consecutive frame on new side → confirmed
+        assert det.check(1, 0.7, 0.5, 11) is True
 
     def test_debounce(self):
         """A second crossing within debounce window is suppressed."""
@@ -464,13 +466,13 @@ class TestBibCrossingDeduplicator:
         assert dedup.should_emit("UNKNOWN", frame_idx=102) is True
 
     def test_unknown_dedup_by_track(self):
-        """Same track_id UNKNOWN within debounce window is suppressed."""
+        """Only 1 UNKNOWN per track — subsequent UNKNOWNs permanently suppressed."""
         dedup = BibCrossingDeduplicator(debounce_frames=300)
         assert dedup.should_emit("UNKNOWN", frame_idx=100, track_id=5) is True
         assert dedup.should_emit("UNKNOWN", frame_idx=101, track_id=5) is False
         assert dedup.should_emit("UNKNOWN", frame_idx=102, track_id=5) is False
-        # After debounce expires
-        assert dedup.should_emit("UNKNOWN", frame_idx=500, track_id=5) is True
+        # Even after debounce expires — still suppressed (1 per track)
+        assert dedup.should_emit("UNKNOWN", frame_idx=500, track_id=5) is False
 
     def test_unknown_different_tracks(self):
         """Different track_ids both pass for UNKNOWN."""

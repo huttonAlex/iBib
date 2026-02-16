@@ -79,9 +79,11 @@ class CrossingEvent:
 
 ## Performance Requirements
 
-- **Detection Rate**: 30-60 fps processing
+- **Detection Rate**: ≥30 fps real-time processing
 - **End-to-End Latency**: <500ms crossing to data output
-- **Detection Accuracy**: >85% target, >80% minimum
+- **Bib Recall**: ≥95% (correct bibs identified / ground truth finishers)
+- **Precision**: ≥95% (correct bibs / all bibs emitted)
+- **Crossing Recall**: ≥95% (crossings detected / ground truth finishers)
 - **Position Accuracy**: PRIMARY priority (correct finish order critical)
 - **Time Accuracy**: ±1 second (RFID provides primary times)
 - **Scale**: Up to 3,000 participants, 10 simultaneous crossings
