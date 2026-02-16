@@ -89,16 +89,16 @@ class TestCrossingDetector:
         assert det.check(1, 0.8, 0.5, 3) is False
 
     def test_crossing_with_default_hysteresis(self):
-        """With default hysteresis=10, need 10 frames on new side to fire."""
+        """With default hysteresis=5, need 5 frames on new side to fire."""
         line = TimingLine(0.5, 0.0, 0.5, 1.0)
         det = CrossingDetector(line, direction="any", debounce_frames=50)
 
         det.check(1, 0.3, 0.5, 1)  # establish left
-        # Frames 2-10: on new side but below hysteresis threshold
-        for f in range(2, 11):
+        # Frames 2-5: on new side but below hysteresis threshold
+        for f in range(2, 6):
             assert det.check(1, 0.7, 0.5, f) is False
-        # Frame 11: 10th consecutive frame on new side → confirmed
-        assert det.check(1, 0.7, 0.5, 11) is True
+        # Frame 6: 5th consecutive frame on new side → confirmed
+        assert det.check(1, 0.7, 0.5, 6) is True
 
     def test_debounce(self):
         """A second crossing within debounce window is suppressed."""

@@ -339,7 +339,7 @@ class CrossingDetector:
         timing_line: TimingLine,
         direction: str = "any",
         debounce_frames: int = 60,
-        hysteresis_frames: int = 10,
+        hysteresis_frames: int = 5,
     ):
         self.timing_line = timing_line
         self.direction = direction
