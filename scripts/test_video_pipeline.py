@@ -395,7 +395,7 @@ def process_video(
                 conf=0.5,
                 device=device,
             )
-            person_tracker = CentroidTracker(max_disappeared=45, max_distance=150)
+            person_tracker = CentroidTracker(max_disappeared=20, max_distance=150)
 
             # Infer expected digit counts for short-bib penalty
             expected_digits = None
@@ -517,8 +517,16 @@ def process_video(
                     and consensus.confidence >= 0.85
                     and track_id in final_consensus
                 ):
-                    ocr_skip_count += 1
-                    continue  # Existing consensus is good; save OCR compute
+                    # Only skip if bib is validated against the bib set.
+                    # If no validator or bib not in set, keep running OCR
+                    # so a wrong initial consensus can self-correct.
+                    bib_validated = (
+                        bib_validator is not None
+                        and consensus.number in bib_validator.bib_set
+                    )
+                    if bib_validated or bib_validator is None:
+                        ocr_skip_count += 1
+                        continue
 
             ocr_batch_items.append((track_id, bbox, det_conf, crop))
 
@@ -569,6 +577,18 @@ def process_video(
                 validation_result = bib_validator.validate(ocr_raw, ocr_conf)
                 validated_number = validation_result.validated
                 is_valid = validation_result.is_valid
+
+            # Early fragment suppression: prevent low-confidence short reads
+            # from polluting the voting pipeline.  Skip only if the number
+            # is NOT a known-valid bib (real 1-2 digit bibs are preserved).
+            _is_known_bib = (
+                bib_validator is not None and validated_number in bib_validator.bib_set
+            )
+            if not _is_known_bib:
+                if len(validated_number) == 1 and ocr_conf < 0.95:
+                    continue
+                if len(validated_number) == 2 and ocr_conf < 0.90:
+                    continue
 
             # Tier 1: Voting
             voting.update(track_id, validated_number, ocr_conf, frame_idx)
@@ -762,7 +782,12 @@ def process_video(
                             confidence = best_conf
 
                     # Short fragment suppression: demote low-conf short bibs
-                    if bib_number != "UNKNOWN":
+                    # unless the bib is a known-valid number in the bib set.
+                    _crossing_bib_valid = (
+                        bib_validator is not None
+                        and bib_number in bib_validator.bib_set
+                    )
+                    if bib_number != "UNKNOWN" and not _crossing_bib_valid:
                         if len(bib_number) == 1 and confidence < 0.95:
                             bib_number = "UNKNOWN"
                             confidence = 0.0
@@ -825,7 +850,12 @@ def process_video(
                         bib_number, confidence, _ = final_consensus[track_id]
 
                     # Short fragment suppression: demote low-conf short bibs
-                    if bib_number != "UNKNOWN":
+                    # unless the bib is a known-valid number in the bib set.
+                    _crossing_bib_valid = (
+                        bib_validator is not None
+                        and bib_number in bib_validator.bib_set
+                    )
+                    if bib_number != "UNKNOWN" and not _crossing_bib_valid:
                         if len(bib_number) == 1 and confidence < 0.95:
                             bib_number = "UNKNOWN"
                             confidence = 0.0

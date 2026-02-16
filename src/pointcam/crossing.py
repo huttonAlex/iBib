@@ -651,6 +651,9 @@ class BibCrossingDeduplicator:
         self._track_last_crossing: Dict[int, int] = {}
         # Track IDs that have already emitted one UNKNOWN (limit 1 per track)
         self._track_unknown_emitted: set = set()
+        # (track_id, bib_number) pairs that have already emitted —
+        # same person track re-crossing with the same bib is always a duplicate.
+        self._track_bib_emitted: set = set()
 
     def should_emit(
         self,
@@ -677,6 +680,14 @@ class BibCrossingDeduplicator:
                 self._track_unknown_emitted.add(track_id)
             return True
 
+        # Per-track-per-bib dedup: same person track re-crossing with the
+        # same bib is always one crossing (jitter/oscillation suppression).
+        if track_id is not None:
+            key = (track_id, bib_number)
+            if key in self._track_bib_emitted:
+                return False
+            # Mark emitted after all other checks pass (below)
+
         # Frame-based debounce
         last = self._recently_crossed.get(bib_number)
         if last is not None and frame_idx - last < self.debounce_frames:
@@ -691,6 +702,8 @@ class BibCrossingDeduplicator:
 
         self._recently_crossed[bib_number] = frame_idx
         self._emission_count[bib_number] = next_count
+        if track_id is not None:
+            self._track_bib_emitted.add((track_id, bib_number))
         return True
 
 
