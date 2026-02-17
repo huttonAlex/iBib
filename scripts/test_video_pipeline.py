@@ -495,6 +495,7 @@ def process_video(
             )
             if not is_visible:
                 edge_rejected += 1
+                continue
 
             # Expand crop for OCR — padding varies by camera placement to
             # compensate for the far side of the bib being clipped by the angle
@@ -872,7 +873,8 @@ def process_video(
 
                 # Bib-level dedup (with escalating confidence)
                 if not bib_dedup.should_emit(
-                    bib_number, frame_idx, confidence, track_id=pid
+                    bib_number, frame_idx, confidence, track_id=pid,
+                    position=p_centroid,
                 ):
                     dedup_suppressed += 1
                     continue
@@ -940,7 +942,8 @@ def process_video(
 
                     # Bib-level dedup (with escalating confidence)
                     if not bib_dedup.should_emit(
-                        bib_number, frame_idx, confidence, track_id=track_id
+                        bib_number, frame_idx, confidence, track_id=track_id,
+                        position=centroid,
                     ):
                         dedup_suppressed += 1
                         continue

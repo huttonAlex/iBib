@@ -575,6 +575,49 @@ class TestBibCrossingDeduplicator:
         assert dedup.should_emit("1234", frame_idx=0) is True
         assert dedup.should_emit("1234", frame_idx=100) is True  # default conf=1.0 >= 0.7
 
+    def test_proximity_suppression_no_count_increment(self):
+        """Same bib within proximity_radius suppressed without incrementing count."""
+        dedup = BibCrossingDeduplicator(debounce_frames=10, proximity_radius=200.0)
+        # 1st emission at (100, 100) — count becomes 1
+        assert dedup.should_emit(
+            "1234", frame_idx=0, confidence=0.95, position=(100.0, 100.0)
+        ) is True
+        # 2nd attempt at (150, 150) — within 200px → suppressed, count stays 1
+        assert dedup.should_emit(
+            "1234", frame_idx=100, confidence=0.95, position=(150.0, 150.0)
+        ) is False
+        assert dedup._emission_count["1234"] == 1  # count did NOT increment
+        # 3rd attempt far away (500, 500) — outside 200px → allowed as count=2
+        # Requires confidence >= 0.7 (2nd emission escalation)
+        assert dedup.should_emit(
+            "1234", frame_idx=200, confidence=0.75, position=(500.0, 500.0)
+        ) is True
+        assert dedup._emission_count["1234"] == 2
+
+    def test_distant_emission_counts_normally(self):
+        """Same bib far away (>proximity_radius) is treated as a new emission."""
+        dedup = BibCrossingDeduplicator(debounce_frames=10, proximity_radius=200.0)
+        # 1st emission at (100, 100)
+        assert dedup.should_emit(
+            "1234", frame_idx=0, confidence=0.95, position=(100.0, 100.0)
+        ) is True
+        # 2nd emission 500px away — requires 0.7 confidence (count=2)
+        assert dedup.should_emit(
+            "1234", frame_idx=100, confidence=0.6, position=(600.0, 100.0)
+        ) is False  # 0.6 < 0.7
+        assert dedup.should_emit(
+            "1234", frame_idx=200, confidence=0.75, position=(600.0, 100.0)
+        ) is True  # 0.75 >= 0.7, passes
+
+    def test_proximity_no_position_fallback(self):
+        """When position=None, falls back to existing count-based behavior."""
+        dedup = BibCrossingDeduplicator(debounce_frames=10, proximity_radius=200.0)
+        # 1st emission without position
+        assert dedup.should_emit("1234", frame_idx=0, confidence=0.95) is True
+        # 2nd emission without position — no proximity check, uses count-based
+        assert dedup.should_emit("1234", frame_idx=100, confidence=0.75) is True
+        assert dedup._emission_count["1234"] == 2
+
 
 # ---------------------------------------------------------------------------
 # CentroidTracker

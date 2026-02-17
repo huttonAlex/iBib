@@ -668,12 +668,13 @@ class BibCrossingDeduplicator:
 
     DEFAULT_ESCALATION = {1: 0.0, 2: 0.7}  # 3+ uses fallback
     ESCALATION_FALLBACK = 0.9  # Required confidence for 3rd+ emission
-    MAX_EMISSIONS_PER_BIB = 3  # Hard cap: no bib emitted more than 3 times
+    MAX_EMISSIONS_PER_BIB = 5  # Hard cap: no bib emitted more than 5 times
 
     def __init__(
         self,
         debounce_frames: int = 300,
         escalation_thresholds: Optional[Dict[int, float]] = None,
+        proximity_radius: float = 200.0,
     ):
         # bib_number → last frame it was reported
         self._recently_crossed: Dict[str, int] = {}
@@ -681,6 +682,9 @@ class BibCrossingDeduplicator:
         self._emission_count: Dict[str, int] = {}
         self.debounce_frames = debounce_frames
         self.escalation_thresholds = escalation_thresholds or self.DEFAULT_ESCALATION.copy()
+        self.proximity_radius = proximity_radius
+        # bib_number → list of (cx, cy) positions where emissions occurred
+        self._emission_positions: Dict[str, List[Tuple[float, float]]] = {}
         # track_id → last frame an UNKNOWN was emitted (for per-track dedup)
         self._track_last_crossing: Dict[int, int] = {}
         # Track IDs that have already emitted one UNKNOWN (limit 1 per track)
@@ -695,6 +699,7 @@ class BibCrossingDeduplicator:
         frame_idx: int,
         confidence: float = 1.0,
         track_id: Optional[int] = None,
+        position: Optional[Tuple[float, float]] = None,
     ) -> bool:
         """Return True if this crossing should be emitted (not a duplicate).
 
@@ -704,6 +709,10 @@ class BibCrossingDeduplicator:
             confidence: Confidence score for this crossing (0.0-1.0).
             track_id: Person/bib track ID.  When provided, UNKNOWN crossings
                 from the same track within the debounce window are suppressed.
+            position: Optional (cx, cy) pixel position.  When provided,
+                emissions for the same bib within ``proximity_radius`` of a
+                previous emission are suppressed *without* incrementing the
+                emission count (same-person track fragment).
         """
         if bib_number == "UNKNOWN":
             if track_id is not None:
@@ -721,6 +730,15 @@ class BibCrossingDeduplicator:
             if key in self._track_bib_emitted:
                 return False
             # Mark emitted after all other checks pass (below)
+
+        # Proximity-based suppression: if this emission is spatially close to
+        # a previous emission for the same bib, it's the same person (fragmented
+        # track) — suppress silently without incrementing emission count.
+        if position is not None and bib_number in self._emission_positions:
+            for prev_pos in self._emission_positions[bib_number]:
+                dist = ((position[0] - prev_pos[0]) ** 2 + (position[1] - prev_pos[1]) ** 2) ** 0.5
+                if dist < self.proximity_radius:
+                    return False
 
         # Frame-based debounce
         last = self._recently_crossed.get(bib_number)
@@ -740,6 +758,8 @@ class BibCrossingDeduplicator:
         self._emission_count[bib_number] = next_count
         if track_id is not None:
             self._track_bib_emitted.add((track_id, bib_number))
+        if position is not None:
+            self._emission_positions.setdefault(bib_number, []).append(position)
         return True
 
 
