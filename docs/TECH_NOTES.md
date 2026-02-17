@@ -22,6 +22,233 @@ Entries are organized by phase and date. Each entry should include:
 
 ---
 
+## 2026-02-17: Bib Detector v2 Retraining & Pipeline Improvement Roadmap
+
+### Bib Detector v2 — Training Results
+
+**Phase/Milestone**: 1.4 - Basic Video Processing
+
+**Objective**:
+Retrain the YOLOv8n bib detector on the full annotated dataset (~6,664 images from 5 data sources) to improve detection recall, which was identified as a primary bottleneck capping bib recall at 32.9%.
+
+**Method**:
+- Consolidated YOLO annotations from 5 data sources using `scripts/consolidate_detector_data.py`
+- Stratified 85/15 train/val split by event (5,662 train / 1,002 val)
+- Trained YOLOv8n for 100 epochs on vast.ai RTX 4090 (24GB VRAM)
+- Early stopping triggered at epoch 87 (best at epoch 67, patience=20)
+- Training time: 2.29 hours
+
+**Data Sources**:
+
+| Source | Pairs | Train | Val |
+|--------|-------|-------|-----|
+| tagged_event_86638 | 3,533 | 3,003 | 530 |
+| tagged_event_89536 | 1,581 | 1,343 | 238 |
+| tagged_event_88679 | 731 | 621 | 110 |
+| unlabeled_batch1 | 202 | 171 | 31 |
+| unlabeled_batch2 | 617 | 524 | 93 |
+| **Total** | **6,664** | **5,662** | **1,002** |
+
+**Results — v1 vs v2 Comparison**:
+
+| Metric | v1 (old) | v2 (new) | Change |
+|--------|----------|----------|--------|
+| Training images | 176 | 5,662 | **32x more data** |
+| Validation images | 45 | 1,002 | **22x more data** |
+| Events in training | 1 | 5 | +4 events |
+| mAP50 | 0.966 | **0.978** | +1.2pp |
+| mAP50-95 | 0.791 | **0.824** | **+3.3pp** |
+| Precision | 0.973 | 0.926 | -4.7pp |
+| Recall | 0.916 | **0.934** | +1.8pp |
+| Training epochs | 50 | 87 (early stop) | — |
+| Best epoch | — | 67 | — |
+
+**Analysis**:
+
+The headline mAP50 improvement (+1.2pp) appears modest because v1 already scored 96.6% — but that was on only 45 validation images from a single event, meaning it was likely overfit. Key improvements:
+
+1. **Generalization**: v2 validates against 1,002 images from 5 different events (different bib designs, camera angles, lighting conditions). The 97.8% mAP50 on this diverse set is more trustworthy than the old 96.6% on a homogeneous 45-image set.
+
+2. **Localization quality**: mAP50-95 improved 79.1% → 82.4% (+3.3pp). This measures tighter bounding boxes across IoU thresholds, meaning the detector produces more precise crops for OCR — directly improving downstream bib reading accuracy.
+
+3. **Recall improvement**: 91.6% → 93.4% (+1.8pp). More bibs are found, especially small/distant ones and bibs in varied conditions that v1 never saw during training.
+
+4. **Precision tradeoff**: 97.3% → 92.6% (-4.7pp). The model is slightly more permissive — but 92.6% precision is still excellent, and false positive detections are filtered by downstream OCR + voting. The recall gain is worth the precision cost.
+
+**Expected Pipeline Impact**:
+
+The detection recall improvement means more bibs enter the OCR+association pipeline:
+- Detection recall estimated improvement: ~67% → 80-90% of finishers get at least one bib detection
+- End-to-end bib recall: 32.9% → potentially 40-50% (detection alone won't fix association/OCR issues)
+- The detector is no longer the primary bottleneck — OCR accuracy and association now limit recall
+
+**Files**:
+- Model: `runs/detect/bib_detector/weights/best.pt` (active, used by all pipeline scripts)
+- Backup: `models/bib_detector_v2.pt`
+- Training metrics: `models/bib_detector_v2_results.csv`
+- Training artifacts: `runs/detect/bib_detector/` (plots, confusion matrices, sample batches)
+- Consolidation script: `scripts/consolidate_detector_data.py`
+
+---
+
+### Pipeline Improvement Roadmap — OCR & Recognition Approaches to Test
+
+**Context**:
+With bib detector v2 deployed, the bottleneck shifts to OCR accuracy and bib-person association. Current OCR models (CRNN, PARSeq) were designed for edge inference on Jetson Orin Nano. The question is whether we should invest in better OCR models or fundamentally different approaches, and what accuracy/speed tradeoffs exist.
+
+**Current State**:
+- OCR reads bibs correctly ~97.9% of the time when it gets a good crop (only 7/330 false positives were actual OCR errors in Run 9)
+- The real problem is that many crops are too small, blurry, angled, or partially occluded for current models to read
+- PaddleOCR/PARSeq/CRNN all struggle with the same failure cases: distant runners, motion blur, folded bibs
+
+**Approaches to Test** (ordered by implementation effort):
+
+#### Approach 1: Multi-Frame Consensus Voting (Low Effort)
+
+Instead of relying on a single OCR read per crop, accumulate reads across multiple frames as the runner approaches. Take the majority vote.
+
+- **How**: Already partially implemented in `EnhancedTemporalVoting`. Needs tuning: longer voting windows, weighted voting by crop quality (size, sharpness), require N agreeing frames before accepting.
+- **Expected impact**: +5-10pp bib recall by recovering bibs that are readable in some frames but not others
+- **Speed cost**: None (already processing every frame)
+- **Hardware**: No change needed
+
+#### Approach 2: YOLOv8s Instead of YOLOv8n (Low Effort)
+
+Upgrade from YOLOv8 Nano (3M params, 8.1 GFLOPs) to YOLOv8 Small (11M params, 28.6 GFLOPs).
+
+- **How**: Retrain with `yolov8s.pt` base weights on the same 6,664-image dataset
+- **Expected impact**: Better small/distant bib detection, ~2-5pp mAP improvement
+- **Speed cost**: ~3x slower inference (~30ms vs ~10ms per frame on Jetson)
+- **Hardware**: Jetson Orin Nano can handle it at stride 2; desktop GPU no issue
+- **Test**: Train and compare mAP50/mAP50-95, then run on test video and compare bib recall
+
+#### Approach 3: Foundation Model OCR — Florence-2 / GOT-OCR (Medium Effort)
+
+Replace lightweight OCR with a vision-language foundation model that understands context.
+
+- **Florence-2** (0.23B/0.77B params): Microsoft's vision foundation model. Can do OCR + region captioning. The 0.23B variant runs on 4GB VRAM.
+- **GOT-OCR** (580M params): Scene text specialist model, good with arbitrary fonts/angles.
+
+- **How**: After YOLO detection, crop bib region, feed to Florence-2/GOT-OCR instead of PARSeq
+- **Expected impact**: Significant improvement on difficult crops (angled, partially occluded, unusual fonts)
+- **Speed cost**: ~50-200ms per crop vs ~5-15ms for PARSeq. Not viable for real-time on Jetson Nano.
+- **Hardware**: Requires Jetson Orin NX (16GB) or desktop GPU. Or use deferred reading architecture (Approach 5).
+- **Test**: Run on the same test video crops, compare character-level accuracy vs PARSeq
+
+#### Approach 4: VLM API Calls for Difficult Crops (Medium Effort)
+
+Use a vision-language model API (Claude, GPT-4V) for crops that local OCR can't read confidently.
+
+- **How**: After local OCR returns low confidence (<0.5), send the crop to a VLM API with prompt: "What number is on this race bib?"
+- **Expected impact**: Near-human accuracy on readable crops; solves almost all OCR failures
+- **Speed cost**: 200-500ms per API call + network latency. Only called for low-confidence crops (maybe 10-20% of total)
+- **Per-call cost**: ~$0.01-0.05 per crop. For 480 finishers with 10-20% fallback: $5-50 per race
+- **Hardware**: Needs network connectivity (cellular/WiFi at finish line)
+- **Test**: Collect low-confidence crops from test video, batch-send to API, measure improvement
+
+#### Approach 5: Deferred Reading Architecture (Higher Effort)
+
+Separate real-time crossing detection from bib reading. Detect crossings in real-time (just person tracking + zone detection), then read bibs offline from saved evidence frames.
+
+- **How**:
+  1. Real-time: Run pose detection only, emit crossing events as UNKNOWN with evidence frame saved
+  2. Post-race: Run bib detection + OCR on saved evidence frames with larger/better models (no real-time constraint)
+  3. Match bib reads back to crossing events by track ID
+- **Expected impact**: Removes all real-time OCR constraints. Can use the best available models with no speed penalty.
+- **Speed cost**: Real-time pipeline is faster (no OCR at all). Post-race processing adds a few minutes.
+- **Hardware**: Post-race processing can run on any hardware (laptop, cloud GPU, etc.)
+- **Test**: Save evidence frames from test video, process offline with Florence-2/GOT-OCR, compare to real-time results
+
+**Recommended Testing Order**:
+
+1. **Multi-frame consensus tuning** — Free, no new dependencies, immediate test
+2. **VLM API on low-confidence crops** — Quick to prototype, measures ceiling of what better OCR can achieve
+3. **YOLOv8s retraining** — Low effort, addresses detection side
+4. **Florence-2 offline** — Test on saved crops to measure accuracy before committing to architecture change
+5. **Deferred reading** — Only if offline model accuracy justifies the architecture change
+
+**Success Criteria**:
+For each approach, measure on the Giants 5K test video (REC-0006-A, 480 finishers):
+- Bib recall (correct bibs / 480 GT finishers)
+- Precision (correct bibs / all bibs emitted)
+- Inference time per frame/crop
+- Any new hardware or network requirements
+
+**Attachments**:
+- Training plots: `runs/detect/bib_detector/results.png`
+- Confusion matrix: `runs/detect/bib_detector/confusion_matrix.png`
+- Full metrics CSV: `models/bib_detector_v2_results.csv`
+
+---
+
+## 2026-02-17: Edge Rejection + Proximity Dedup + Bib Detector v2 (Run 11b)
+
+### Changes
+
+**Fix 1 — Restore edge rejection** (`scripts/test_video_pipeline.py`):
+Restored the `continue` after `edge_rejected += 1` that was removed in the Run 10 user changes. Without it, OCR detections had exploded ~50x (1.5k → 75k rows), flooding consensus with partial/wrong readings from frame-clipped bibs.
+
+**Fix 2 — Proximity-aware bib dedup** (`src/pointcam/crossing.py`):
+Replaced the blunt `MAX_EMISSIONS_PER_BIB=3` hard cap with position-aware suppression in `BibCrossingDeduplicator`. When a same-bib emission is attempted within 200px of a previous emission, it's silently suppressed *without* incrementing the emission count (same-person track fragment). Only spatially distant emissions count toward the cap (raised to 5 as safety net).
+
+**Bib detector v2**: New YOLOv8n model trained on 6,664 images from 5 events (see separate v2 entry above). Better recall (93.4% vs 91.6%) and localization (mAP50-95 82.4% vs 79.1%).
+
+### Ground Truth Change
+
+Previous runs (9, 10) were scored against `bib_order.txt` (480 bibs) which contained many non-finishers and partial reads from earlier pipeline runs. Starting with Run 11b, all runs are scored against **official race results** from the scoring provider (`5k-run-walk-overall-results-20260214163650-0500.csv`, 2,622 finishers).
+
+**Important caveat on recall**: The test video (REC-0006-A.mp4) covers only ~25 minutes of finish line footage (~30 min video, 54,002 frames at 30fps), not the entire race (~90 min of finishers). Manual verification confirmed bib 2675 (official position 933) as one of the last bibs visible in the video, placing the **estimated visible finishers at ~933**. The recall denominator of 2,622 is all official finishers, so the 22.3% recall represents coverage of the full race from a partial video. Against the ~933 visible finishers, the effective recall is approximately **585/933 = 62.7%**.
+
+All previous runs have been rescored against the official results for apples-to-apples comparison.
+
+### Results (scored against official race results, 2,622 finishers)
+
+| Metric | Run 9 | Run 10 | **Run 11b** |
+|--------|-------|--------|-------------|
+| Recall (full race) | 16.4% (431/2622) | 14.3% (375/2622) | **22.3% (585/2622)** |
+| Recall (visible, ~933) | 46.2% (431/933) | 40.2% (375/933) | **62.7% (585/933)** |
+| Precision | 88.3% (431/488) | 88.0% (375/426) | **96.1% (585/609)** |
+| True positives | 431 | 375 | **585** |
+| False positives | 57 | 51 | **24** |
+| Total crossings | 1,091 | 714 | 819 |
+| UNKNOWN | 392 (35.9%) | 105 (14.7%) | **87 (10.6%)** |
+| Unique bibs emitted | 488 | 426 | 609 |
+| Dedup suppressed | 1,032 | — | 1,457 |
+| Edge-rejected | — | 0 (removed) | 47,115 |
+
+### Configuration
+```
+python scripts/test_video_pipeline.py REC-0006-A.mp4 \
+  --no-video --bib-range 2-3000 --crossing-mode zone \
+  --placement right --ocr parseq
+```
+Hardware: Jetson Orin Nano Super, PyTorch models, PARSeq OCR.
+
+### Analysis
+
+**Recall improved significantly**: 585 correct bibs vs 431 (Run 9) and 375 (Run 10) — a **+36% increase** over the previous best. Against the ~933 visible finishers in the video, effective recall is **62.7%** (up from 46.2% in Run 9). This is driven by the combination of:
+1. Bib detector v2 finding more bibs (better recall/localization)
+2. Edge rejection preventing OCR noise from corrupting consensus votes
+3. Proximity dedup allowing more legitimate emissions (less aggressive than hard cap)
+
+**Precision reached 96.1%**: Only 24 false positive bibs, down from 57 (Run 9). The remaining FPs are mostly short partial reads (1, 2, 3, 15, 23, 25) — classic OCR fragments of longer bib numbers.
+
+**UNKNOWN rate at 10.6%**: Continued improvement from Run 10's cross-track seeding and REJECT vote weight, now combined with cleaner consensus from edge rejection.
+
+**Edge rejection is critical**: 47,115 partial bibs were filtered before OCR. Without this filter (Run 10), these flood the consensus system with wrong readings.
+
+### Comparison Note — Old vs New Ground Truth
+
+The previous scoring against `bib_order.txt` (480 bibs) showed inflated recall numbers (Run 9: 32.9%, Run 10: 29.0%) because that file contained many non-finisher bibs and OCR fragments. Against official results, Run 9 was actually 16.4% recall with 88.3% precision — not 32.9% recall with 32.4% precision. The pipeline was more precise than previously thought, but also identifying fewer real finishers.
+
+### Next Steps
+1. **Refine visible finisher count**: Manual spot-check places ~933 finishers in the video (bib 2675, position 933, near end of video). A more precise count could be obtained by cross-referencing finish times with the video time window
+2. **Short-bib FP cleanup**: The 24 remaining FPs are almost all 1-2 digit partial reads — tighter fragment rejection could eliminate most
+3. **Larger YOLO model (YOLOv8s)**: May improve detection of small/distant bibs
+4. **OCR model improvement**: Fine-tune PARSeq on more diverse data
+
+---
+
 ## 2026-02-16: Cross-Track Bib Association & UNKNOWN Recovery (Run 10)
 
 ### Changes (Issues #1-3 from Run 9 analysis)
@@ -1065,21 +1292,23 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 
 ### Phase 1 Baselines
 
-**Standard test: REC-0006-A.mp4 (Giants 5K, 30fps, 1800s, 480 finishers)**
+**Standard test: REC-0006-A.mp4 (Giants 5K, 30fps, 1800s)**
 
-| Run | Date | Config | FPS | Wall (min) | Crossings | ID'd | Correct Bibs | Precision | UNKNOWN% |
-|-----|------|--------|-----|-----------|-----------|------|-------------|-----------|----------|
-| Run 3 | 2026-02-14 | PyTorch, full video, stride 1 | ~20 avg | ~45 | 207 | 106 | 37 | 44% | 49% |
-| Run 4a | 2026-02-15 | PyTorch, from 460s, no OCR skip | ~7 | 96 | 178 | 102 | 34 | 36.6% | 43% |
-| Run 4b | 2026-02-15 | TRT YOLO + OCR skip, from 460s | ~10.5 | 64 | 183 | 112 | 34 | 32.7% | 39% |
+**Ground truth**: Official race results (2,622 finishers). Video covers ~25 min of finish line footage (~933 visible finishers based on manual verification that bib 2675, official position 933, is one of the last visible bibs). "Recall (visible)" uses the ~933 denominator for a more meaningful comparison.
 
-**Notes on Run 4 comparison:**
-- TRT YOLO engines cut detection+pose from ~68ms to ~20ms per frame
-- OCR skip reduced OCR calls by 51% (49,950 → 24,352)
-- Wall clock 1.5x faster (96→64 min), bottleneck is now PyTorch PARSeq OCR (38ms/batch)
-- Correct bib count identical (34), but TRT run has more false positives (+11)
-- jetson_clocks locked CPU at 1.34 GHz (was 729 MHz) for both runs
-- Next step: TensorRT OCR backend to address remaining OCR bottleneck
+| Run | Date | Config | Crossings | Correct Bibs | FP Bibs | Recall (visible, ~933) | Recall (full, 2622) | Precision | UNKNOWN% |
+|-----|------|--------|-----------|-------------|---------|----------------------|--------------------|-----------|---------|
+| Run 3 | 2026-02-14 | PyTorch, full video, stride 1 | 207 | — | — | — | — | — | 49% |
+| Run 4a | 2026-02-15 | PyTorch, from 460s, no OCR skip | 178 | — | — | — | — | — | 43% |
+| Run 4b | 2026-02-15 | TRT YOLO + OCR skip, from 460s | 183 | — | — | — | — | — | 39% |
+| Run 9 | 2026-02-16 | Zone, deferred emission | 1,091 | 431 | 57 | 46.2% | 16.4% | 88.3% | 35.9% |
+| Run 10 | 2026-02-16 | + cross-track seed, REJECT votes | 714 | 375 | 51 | 40.2% | 14.3% | 88.0% | 14.7% |
+| **Run 11b** | **2026-02-17** | **+ edge reject, prox dedup, YOLO v2** | **819** | **585** | **24** | **62.7%** | **22.3%** | **96.1%** | **10.6%** |
+
+**Notes:**
+- Runs 3-4b were scored against a different ground truth (480 bibs from bib_order.txt) and have not been rescored against official results
+- Run 11b uses bib detector v2 (trained on 6,664 images), restored edge rejection, and proximity-aware dedup
+- Visible finisher estimate (~933) based on manual confirmation that bib 2675 (official position 933) appears near the end of the video
 
 ### Phase 2 Baselines
 *To be populated during Phase 2*
@@ -1111,3 +1340,5 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | E016 | 2026-02-16 | 1.4 | Zone crossing Runs 7-8 | 28.5% recall, 30.6% precision | Zone mode, min_frames=30, cap=3 |
 | E017 | 2026-02-16 | 1.4 | Deferred emission Run 9 | 32.9% recall, 32.4% precision | Only 7/330 FP are OCR errors; rest are real bibs |
 | E018 | 2026-02-16 | 1.4 | Cross-track bib + UNKNOWN recovery Run 10 | 29.0% recall (-3.9pp), 14.7% UNKNOWN (-21.2pp) | UNKNOWN fix works; recall regressed from dedup cascade |
+| E019 | 2026-02-17 | 1.4 | Bib detector v2 retraining (6,664 images) | mAP50=0.978, mAP50-95=0.824, R=0.934 | 32x more data, 5 events, early stop epoch 87 |
+| E020 | 2026-02-17 | 1.4 | Edge rejection + proximity dedup + v2 detector Run 11b | 22.3% recall, 96.1% precision (vs 2622 GT) | +36% more correct bibs vs Run 9; FPs down 57→24; scored against official results |

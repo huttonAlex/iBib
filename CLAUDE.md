@@ -47,6 +47,10 @@ Frame (60fps) → Preprocess → Bib Detect (YOLOv8) → OCR (PaddleOCR) → Tra
 - **Primary**: NVIDIA Jetson Orin Nano (8GB) with TensorRT optimization
 - **Alternative**: Raspberry Pi 5 (8GB) with ONNX Runtime
 
+### Jetson Access
+- **SSH**: `ssh alex@192.168.1.169`
+- **Repo path**: `/home/alex/pointcam`
+
 ## Key Technical Patterns
 
 ### CTP01 Protocol
