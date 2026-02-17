@@ -348,6 +348,8 @@ def process_video(
     # Used for retroactive bib recovery when emitting UNKNOWN for dead person tracks.
     bib_track_last_pos: Dict[int, Tuple[float, float]] = {}  # bid -> (cx, cy)
     bib_track_last_frame: Dict[int, int] = {}  # bid -> last frame seen
+    bib_track_first_pos: Dict[int, Tuple[float, float]] = {}  # bid -> (cx, cy) at first obs
+    bib_track_first_frame: Dict[int, int] = {}  # bid -> first frame seen
 
     # --- Person detection + crossing detection (optional) ---
     timing_line = None
@@ -472,6 +474,9 @@ def process_video(
 
         # Update historical bib positions (for retroactive recovery)
         for bid, (b_centroid, b_bbox) in tracked.items():
+            if bid not in bib_track_first_pos:
+                bib_track_first_pos[bid] = b_centroid
+                bib_track_first_frame[bid] = frame_idx
             bib_track_last_pos[bid] = b_centroid
             bib_track_last_frame[bid] = frame_idx
 
@@ -822,36 +827,75 @@ def process_video(
                                         best_conf = fc_conf
 
                     # Retroactive recovery: scan ALL historical bib positions
-                    # for HIGH/MEDIUM matches near this person's last chest.
+                    # for HIGH/MEDIUM matches near this person's lifetime.
+                    # Uses multi-point spatial comparison and per-bib-number
+                    # aggregation (multiple bib tracks may read the same number).
                     if best_bib is None:
                         diag = person_track_diag.get(pid, {})
                         person_first_frame = diag.get("first_frame", frame_idx)
-                        temporal_window = 2.0 * fps  # bib seen within 2s of person
-                        retro_margin = 400  # px search radius
+                        person_last_frame = diag.get("last_frame", frame_idx)
+                        person_first_chest = diag.get("first_chest", p_centroid)
+                        person_last_chest = diag.get("last_chest", p_centroid)
+                        temporal_margin = 5.0 * fps  # 5s margin for lifetime overlap
+                        retro_margin = 600  # px search radius
+
+                        # Aggregate by bib number: find minimum distance across
+                        # all tracks that read the same number.
+                        # bib_number -> (min_dist, conf)
+                        retro_candidates: Dict[str, Tuple[float, float]] = {}
 
                         for bid, (bc_number, bc_conf, bc_level) in all_consensus.items():
                             if bc_level not in ("high", "medium"):
                                 continue
-                            if bc_conf <= best_conf:
-                                continue
-                            # Temporal overlap: bib must have been seen near
-                            # person's lifetime
+                            # Full lifetime temporal overlap check
+                            bib_first = bib_track_first_frame.get(bid)
                             bib_last = bib_track_last_frame.get(bid)
-                            if bib_last is None:
+                            if bib_first is None or bib_last is None:
                                 continue
-                            if bib_last < person_first_frame - temporal_window:
+                            # Check if bib lifetime overlaps person lifetime
+                            # (with temporal_margin on both sides)
+                            if bib_last < person_first_frame - temporal_margin:
                                 continue
-                            # Spatial proximity: bib's last position near
-                            # person's chest
-                            bpos = bib_track_last_pos.get(bid)
-                            if bpos is None:
+                            if bib_first > person_last_frame + temporal_margin:
                                 continue
-                            bcx, bcy = bpos
-                            chest_x, chest_y = p_centroid
-                            dist = ((bcx - chest_x) ** 2 + (bcy - chest_y) ** 2) ** 0.5
-                            if dist < retro_margin:
-                                best_bib = bc_number
-                                best_conf = bc_conf
+
+                            # Multi-point spatial comparison: check all combos
+                            # of (person first/last chest) x (bib first/last pos)
+                            bib_positions = []
+                            bfp = bib_track_first_pos.get(bid)
+                            blp = bib_track_last_pos.get(bid)
+                            if bfp is not None:
+                                bib_positions.append(bfp)
+                            if blp is not None and blp != bfp:
+                                bib_positions.append(blp)
+                            if not bib_positions:
+                                continue
+
+                            person_positions = [person_first_chest, person_last_chest]
+                            min_dist = float("inf")
+                            for pp in person_positions:
+                                for bp in bib_positions:
+                                    d = (
+                                        (pp[0] - bp[0]) ** 2 + (pp[1] - bp[1]) ** 2
+                                    ) ** 0.5
+                                    if d < min_dist:
+                                        min_dist = d
+
+                            if min_dist < retro_margin:
+                                prev = retro_candidates.get(bc_number)
+                                if prev is None or min_dist < prev[0]:
+                                    retro_candidates[bc_number] = (min_dist, bc_conf)
+
+                        # Pick the best candidate: highest confidence, then
+                        # smallest distance as tiebreaker
+                        for rc_number, (rc_dist, rc_conf) in retro_candidates.items():
+                            if rc_conf > best_conf or (
+                                rc_conf == best_conf
+                                and best_bib is not None
+                                and rc_dist < retro_candidates.get(best_bib, (float("inf"),))[0]
+                            ):
+                                best_bib = rc_number
+                                best_conf = rc_conf
 
                     if best_bib is not None:
                         bib_number = best_bib

@@ -494,6 +494,39 @@ class TestPersistentPersonBibAssociator:
         # Track 2 should NOT inherit votes (too far)
         assert assoc.get_bib(2) is None
 
+    def test_bbox_overlap_association(self):
+        """Bib center outside person bbox but bib bbox overlaps → match succeeds."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=200, memory_frames=100, min_votes=1
+        )
+        # Person bbox is (200, 100, 300, 500)
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        # Bib center (310, 250) is OUTSIDE person bbox (x=310 > 300),
+        # but bib bbox (280, 230, 340, 270) overlaps person bbox (280-300 overlap on x)
+        bib_tracked = {10: ((310.0, 250.0), (280, 230, 340, 270))}
+        consensus = {10: ("1234", 0.95, "high")}
+
+        for i in range(3):
+            assoc.update(person_tracked, bib_tracked, consensus, frame_idx=i)
+
+        assert assoc.get_bib(1) == "1234"
+
+    def test_no_match_when_bboxes_fully_disjoint(self):
+        """Both bib center and bib bbox fully outside person bbox → no match."""
+        assoc = PersistentPersonBibAssociator(
+            max_distance=50, memory_frames=100, min_votes=1
+        )
+        # Person bbox at (200, 100, 300, 500)
+        person_tracked = {1: ((250.0, 300.0), (200, 100, 300, 500))}
+        # Bib bbox fully to the right, no overlap at all (x range 400-460 vs 200-300)
+        bib_tracked = {10: ((430.0, 250.0), (400, 230, 460, 270))}
+        consensus = {10: ("1234", 0.95, "high")}
+
+        for i in range(5):
+            assoc.update(person_tracked, bib_tracked, consensus, frame_idx=i)
+
+        assert assoc.get_bib(1) is None
+
 
 # ---------------------------------------------------------------------------
 # BibCrossingDeduplicator

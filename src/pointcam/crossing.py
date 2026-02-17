@@ -562,7 +562,10 @@ class PersistentPersonBibAssociator:
 
             for bid, (b_centroid, b_bbox) in bib_tracked.items():
                 bcx, bcy = b_centroid
-                inside = px1 <= bcx <= px2 and py1 <= bcy <= py2
+                bx1, by1, bx2, by2 = b_bbox
+                center_inside = px1 <= bcx <= px2 and py1 <= bcy <= py2
+                bbox_overlap = not (bx2 < px1 or bx1 > px2 or by2 < py1 or by1 > py2)
+                inside = center_inside or bbox_overlap
                 dist = np.sqrt(
                     (p_centroid[0] - bcx) ** 2 + (p_centroid[1] - bcy) ** 2
                 )
