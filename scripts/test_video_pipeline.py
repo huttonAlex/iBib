@@ -841,43 +841,12 @@ def process_video(
                                         best_conf = fc_conf
 
                     # Co-occurrence recovery: use same-frame bib-person
-                    # containment records + fragmented track bridging.
+                    # containment records (direct containment only, no
+                    # cross-track bridging to avoid contamination).
                     if best_bib is None:
-                        diag = person_track_diag.get(pid, {})
-                        person_first_frame = diag.get("first_frame", frame_idx)
-                        person_last_frame = diag.get("last_frame", frame_idx)
-                        person_first_chest = diag.get("first_chest", p_centroid)
-                        person_last_chest = diag.get("last_chest", p_centroid)
-                        temporal_margin = 5.0 * fps
-                        spatial_margin = 500  # px for related-track search
-
-                        # Step 1: Find person tracks that are likely the same
-                        # physical person (fragmented tracks).
-                        related_pids = {pid}
-                        for other_pid, other_diag in person_track_diag.items():
-                            if other_pid == pid:
-                                continue
-                            of = other_diag.get("first_frame", 0)
-                            ol = other_diag.get("last_frame", 0)
-                            if ol < person_first_frame - temporal_margin:
-                                continue
-                            if of > person_last_frame + temporal_margin:
-                                continue
-                            ofc = other_diag.get("first_chest", (0, 0))
-                            olc = other_diag.get("last_chest", (0, 0))
-                            min_d = min(
-                                ((pp[0] - po[0]) ** 2 + (pp[1] - po[1]) ** 2) ** 0.5
-                                for pp in [person_first_chest, person_last_chest]
-                                for po in [ofc, olc]
-                            )
-                            if min_d < spatial_margin:
-                                related_pids.add(other_pid)
-
-                        # Step 2: Find bibs that were inside any related
-                        # person track (same-frame containment).
                         cooccurrence_candidates: Dict[str, float] = {}
                         for bid, person_set in bib_overlapped_persons.items():
-                            if not (person_set & related_pids):
+                            if pid not in person_set:
                                 continue
                             if bid not in all_consensus:
                                 continue
