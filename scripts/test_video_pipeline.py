@@ -350,6 +350,8 @@ def process_video(
     bib_track_last_frame: Dict[int, int] = {}  # bid -> last frame seen
     bib_track_first_pos: Dict[int, Tuple[float, float]] = {}  # bid -> (cx, cy) at first obs
     bib_track_first_frame: Dict[int, int] = {}  # bid -> first frame seen
+    # Same-frame bib-person spatial containment: which person tracks each bib was ever inside
+    bib_overlapped_persons: Dict[int, set] = {}  # bid -> {pid, ...}
 
     # --- Person detection + crossing detection (optional) ---
     timing_line = None
@@ -725,6 +727,18 @@ def process_video(
             # Accumulate person→bib associations via voting
             person_bib_assoc.update(person_tracked, tracked, final_consensus, frame_idx)
 
+            # Record same-frame bib-person spatial containment
+            if person_tracked and tracked:
+                for pid, (p_centroid, p_bbox) in person_tracked.items():
+                    px1, py1, px2, py2 = p_bbox
+                    for bid, (b_centroid, b_bbox) in tracked.items():
+                        bx1, by1, bx2, by2 = b_bbox
+                        bcx, bcy = b_centroid
+                        # Bib center inside person bbox OR any bbox overlap
+                        if (px1 <= bcx <= px2 and py1 <= bcy <= py2) or \
+                           not (bx2 < px1 or bx1 > px2 or by2 < py1 or by1 > py2):
+                            bib_overlapped_persons.setdefault(bid, set()).add(pid)
+
             # Diagnostic: track person lifecycle
             for pid, (p_centroid, p_bbox) in person_tracked.items():
                 if pid not in person_track_diag:
@@ -826,41 +840,85 @@ def process_video(
                                         best_bib = fc_number
                                         best_conf = fc_conf
 
-                    # Retroactive recovery: scan ALL historical bib positions
-                    # for HIGH/MEDIUM matches near this person's lifetime.
-                    # Uses multi-point spatial comparison and per-bib-number
-                    # aggregation (multiple bib tracks may read the same number).
+                    # Co-occurrence recovery: use same-frame bib-person
+                    # containment records + fragmented track bridging.
                     if best_bib is None:
                         diag = person_track_diag.get(pid, {})
                         person_first_frame = diag.get("first_frame", frame_idx)
                         person_last_frame = diag.get("last_frame", frame_idx)
                         person_first_chest = diag.get("first_chest", p_centroid)
                         person_last_chest = diag.get("last_chest", p_centroid)
-                        temporal_margin = 5.0 * fps  # 5s margin for lifetime overlap
+                        temporal_margin = 5.0 * fps
+                        spatial_margin = 500  # px for related-track search
+
+                        # Step 1: Find person tracks that are likely the same
+                        # physical person (fragmented tracks).
+                        related_pids = {pid}
+                        for other_pid, other_diag in person_track_diag.items():
+                            if other_pid == pid:
+                                continue
+                            of = other_diag.get("first_frame", 0)
+                            ol = other_diag.get("last_frame", 0)
+                            if ol < person_first_frame - temporal_margin:
+                                continue
+                            if of > person_last_frame + temporal_margin:
+                                continue
+                            ofc = other_diag.get("first_chest", (0, 0))
+                            olc = other_diag.get("last_chest", (0, 0))
+                            min_d = min(
+                                ((pp[0] - po[0]) ** 2 + (pp[1] - po[1]) ** 2) ** 0.5
+                                for pp in [person_first_chest, person_last_chest]
+                                for po in [ofc, olc]
+                            )
+                            if min_d < spatial_margin:
+                                related_pids.add(other_pid)
+
+                        # Step 2: Find bibs that were inside any related
+                        # person track (same-frame containment).
+                        cooccurrence_candidates: Dict[str, float] = {}
+                        for bid, person_set in bib_overlapped_persons.items():
+                            if not (person_set & related_pids):
+                                continue
+                            if bid not in all_consensus:
+                                continue
+                            bc_number, bc_conf, bc_level = all_consensus[bid]
+                            if bc_level not in ("high", "medium"):
+                                continue
+                            prev = cooccurrence_candidates.get(bc_number, 0.0)
+                            if bc_conf > prev:
+                                cooccurrence_candidates[bc_number] = bc_conf
+
+                        # Pick best co-occurrence candidate
+                        for rc_number, rc_conf in cooccurrence_candidates.items():
+                            if rc_conf > best_conf:
+                                best_bib = rc_number
+                                best_conf = rc_conf
+
+                    # Step 3: Fall back to position-based recovery if
+                    # co-occurrence found nothing.
+                    if best_bib is None:
+                        diag = person_track_diag.get(pid, {})
+                        person_first_frame = diag.get("first_frame", frame_idx)
+                        person_last_frame = diag.get("last_frame", frame_idx)
+                        person_first_chest = diag.get("first_chest", p_centroid)
+                        person_last_chest = diag.get("last_chest", p_centroid)
+                        temporal_margin = 5.0 * fps
                         retro_margin = 600  # px search radius
 
-                        # Aggregate by bib number: find minimum distance across
-                        # all tracks that read the same number.
-                        # bib_number -> (min_dist, conf)
                         retro_candidates: Dict[str, Tuple[float, float]] = {}
 
                         for bid, (bc_number, bc_conf, bc_level) in all_consensus.items():
                             if bc_level not in ("high", "medium"):
                                 continue
-                            # Full lifetime temporal overlap check
                             bib_first = bib_track_first_frame.get(bid)
                             bib_last = bib_track_last_frame.get(bid)
                             if bib_first is None or bib_last is None:
                                 continue
-                            # Check if bib lifetime overlaps person lifetime
-                            # (with temporal_margin on both sides)
                             if bib_last < person_first_frame - temporal_margin:
                                 continue
                             if bib_first > person_last_frame + temporal_margin:
                                 continue
 
-                            # Multi-point spatial comparison: check all combos
-                            # of (person first/last chest) x (bib first/last pos)
                             bib_positions = []
                             bfp = bib_track_first_pos.get(bid)
                             blp = bib_track_last_pos.get(bid)
@@ -886,13 +944,12 @@ def process_video(
                                 if prev is None or min_dist < prev[0]:
                                     retro_candidates[bc_number] = (min_dist, bc_conf)
 
-                        # Pick the best candidate: highest confidence, then
-                        # smallest distance as tiebreaker
                         for rc_number, (rc_dist, rc_conf) in retro_candidates.items():
                             if rc_conf > best_conf or (
                                 rc_conf == best_conf
                                 and best_bib is not None
-                                and rc_dist < retro_candidates.get(best_bib, (float("inf"),))[0]
+                                and rc_dist
+                                < retro_candidates.get(best_bib, (float("inf"),))[0]
                             ):
                                 best_bib = rc_number
                                 best_conf = rc_conf
