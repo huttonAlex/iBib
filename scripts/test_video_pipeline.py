@@ -843,10 +843,15 @@ def process_video(
                     # Co-occurrence recovery: use same-frame bib-person
                     # containment records (direct containment only, no
                     # cross-track bridging to avoid contamination).
+                    # Skip bibs that overlapped too many person tracks
+                    # (crowd noise — unreliable for recovery).
                     if best_bib is None:
+                        max_overlap_persons = 3
                         cooccurrence_candidates: Dict[str, float] = {}
                         for bid, person_set in bib_overlapped_persons.items():
                             if pid not in person_set:
+                                continue
+                            if len(person_set) > max_overlap_persons:
                                 continue
                             if bid not in all_consensus:
                                 continue
