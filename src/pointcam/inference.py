@@ -119,7 +119,12 @@ class OnnxParseqOCR:
             tokenizer_path = str(onnx_p.with_suffix(".tokenizer.json"))
 
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self.session = ort.InferenceSession(onnx_path, providers=providers)
+        try:
+            self.session = ort.InferenceSession(onnx_path, providers=providers)
+        except Exception:
+            providers = ["CPUExecutionProvider"]
+            self.session = ort.InferenceSession(onnx_path, providers=providers)
+            print(f"  WARNING: CUDA EP failed, falling back to CPU for PARSeq")
         self.input_name = self.session.get_inputs()[0].name
         self._tokenizer = ParseqTokenizer.from_json(tokenizer_path)
 
