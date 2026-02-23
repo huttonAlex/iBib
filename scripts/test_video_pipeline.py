@@ -37,6 +37,92 @@ from pointcam.pipeline import PipelineConfig, process_video
 from pointcam.recognition import BibSetValidator
 
 
+class PARSeqOCR:
+    """PARSeq OCR from fine-tuned PyTorch checkpoint."""
+
+    def __init__(self, checkpoint_path: str, device: str = "cpu"):
+        import torch
+        from PIL import Image  # noqa: F811
+
+        self._torch = torch
+        self._Image = Image
+        self.device = device
+        self.model = torch.hub.load(
+            "baudm/parseq", "parseq", pretrained=True, trust_repo=True
+        )
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if "model_state_dict" in state:
+            self.model.load_state_dict(state["model_state_dict"])
+        else:
+            self.model.load_state_dict(state)
+        self.model.eval().to(device)
+
+    def predict(self, crop_bgr):
+        import numpy as np
+        import cv2
+
+        torch = self._torch
+        Image = self._Image
+        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        img = pil_img.resize((128, 32), Image.BICUBIC)
+        t = torch.from_numpy(np.array(img, dtype=np.float32)).permute(2, 0, 1) / 255.0
+        tensor = ((t - 0.5) / 0.5).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(tensor)
+            probs = logits.softmax(-1)
+            preds, probs_out = self.model.tokenizer.decode(probs)
+
+        text = preds[0]
+        p = probs_out[0]
+        if p.numel() == 0:
+            confidence = 0.5
+        elif p.dim() == 1:
+            confidence = p.cumprod(-1)[-1].item()
+        else:
+            confidence = p.cumprod(-1)[:, -1].item()
+
+        digits = "".join(c for c in text if c.isdigit())
+        return digits, confidence
+
+    def predict_batch(self, crops_bgr):
+        import numpy as np
+        import cv2
+
+        torch = self._torch
+        if not crops_bgr:
+            return []
+
+        preprocessed = []
+        for crop in crops_bgr:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(rgb, (128, 32), interpolation=cv2.INTER_CUBIC)
+            t = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
+            preprocessed.append((t - 0.5) / 0.5)
+
+        batch = torch.from_numpy(np.stack(preprocessed)).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(batch)
+            probs = logits.softmax(-1)
+            preds, probs_out = self.model.tokenizer.decode(probs)
+
+        results = []
+        for i in range(len(crops_bgr)):
+            text = preds[i]
+            p = probs_out[i]
+            if p.numel() == 0:
+                confidence = 0.5
+            elif p.dim() == 1:
+                confidence = p.cumprod(-1)[-1].item()
+            else:
+                confidence = p.cumprod(-1)[:, -1].item()
+            digits = "".join(c for c in text if c.isdigit())
+            results.append((digits, confidence))
+        return results
+
+
 def _ensure_parseq_tokenizer(parseq_onnx: Path) -> Path:
     tokenizer_path = parseq_onnx.with_suffix(".tokenizer.json")
     if not tokenizer_path.exists():
@@ -178,7 +264,7 @@ def main():
         type=str,
         default="onnx",
         choices=["onnx", "tensorrt", "pytorch"],
-        help="OCR inference backend. 'pytorch' is deprecated and maps to 'onnx'.",
+        help="OCR inference backend. 'pytorch' uses torch.hub PARSeq (GPU-capable).",
     )
     parser.add_argument(
         "--no-ocr-skip",
@@ -225,13 +311,20 @@ def main():
     else:
         print("Bib set:  None (validation disabled)")
 
-    if args.ocr_backend == "pytorch":
-        print("WARNING: 'pytorch' backend is deprecated; using 'onnx'.")
-        args.ocr_backend = "onnx"
-
     print()
     print("Loading OCR model...")
-    if args.ocr_backend == "tensorrt":
+    if args.ocr_backend == "pytorch":
+        if args.ocr == "parseq":
+            import torch
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            ckpt = project_root / "runs/ocr_finetune/parseq_gpu_v1/best.pt"
+            ocr_model = PARSeqOCR(str(ckpt), device=device)
+            print(f"  PARSeq PyTorch loaded from {ckpt} (device: {device})")
+        else:
+            print("ERROR: PyTorch backend only supports PARSeq, not CRNN.")
+            sys.exit(1)
+    elif args.ocr_backend == "tensorrt":
         if args.ocr == "parseq":
             parseq_onnx = project_root / "models/ocr_parseq.onnx"
             _ensure_parseq_tokenizer(parseq_onnx)
