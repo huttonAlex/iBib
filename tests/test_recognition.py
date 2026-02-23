@@ -79,8 +79,8 @@ class TestBibSetValidator:
 
     def test_alternatives(self, large_validator):
         """Test that alternatives are returned for fuzzy matches."""
-        # 1235 should fuzzy match to 1234, 1236, etc.
-        result = large_validator.validate("1235", 0.9)
+        # 235 should fuzzy match to 1235 via leading-digit recovery
+        result = large_validator.validate("235", 0.9)
 
         assert result.is_corrected is True
         # Should have some alternatives
@@ -448,9 +448,9 @@ class TestTier1Integration:
 
         track_id = 1
 
-        # Simulate OCR returning 1235 (not in set, close to 1234)
+        # Simulate OCR returning 235 (missing leading digit; should correct to 1235)
         for frame_idx in range(5):
-            validation = validator.validate("1235", 0.85)
+            validation = validator.validate("235", 0.85)
             voting.update(track_id, validation.validated, 0.85, frame_idx)
 
         consensus = voting.get_consensus(track_id)
@@ -458,7 +458,7 @@ class TestTier1Integration:
         result = confidence_mgr.classify(
             bib_number=consensus.number,
             ocr_confidence=0.85,
-            validation_result=validator.validate("1235", 0.85),
+            validation_result=validator.validate("235", 0.85),
             voting_result=consensus,
         )
 

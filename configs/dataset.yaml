@@ -1,6 +1,6 @@
 # YOLOv8 Dataset Configuration for PointCam Bib Detection
 
-path: /mnt/c/Users/alex/Projects/pointCam/data  # Dataset root directory (absolute)
+path: ./data  # Dataset root directory (relative to project root)
 train: images/train
 val: images/val
 

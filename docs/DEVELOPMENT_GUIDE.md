@@ -15,12 +15,13 @@ pointCam/
 ├── docs/
 │   ├── DESIGN_DECISIONS.md  # Technical decision log
 │   ├── DEVELOPMENT_GUIDE.md # This file
+│   ├── MODEL_ASSETS.md       # Pinned model assets & verification
 │   └── TECH_NOTES.md        # Technical findings and notes
-├── src/                     # Source code (to be created)
-├── tests/                   # Test suites (to be created)
-├── data/                    # Sample data and datasets (to be created)
-├── models/                  # Trained models (to be created)
-└── scripts/                 # Utility scripts (to be created)
+├── src/                     # Source code (pipeline + modules)
+├── tests/                   # Unit + integration tests
+├── data/                    # Datasets and sample data
+├── models/                  # Trained model assets (pinned)
+└── scripts/                 # Utility scripts & CLI tools
 ```
 
 ## Development Phases
@@ -28,28 +29,29 @@ pointCam/
 See [ROADMAP.md](../ROADMAP.md) for detailed phase breakdown. Current phase information:
 
 **Current Phase**: Phase 1 - Proof of Concept
-**Current Milestone**: 1.1 - Dataset & Research
+**Current Milestone**: 1.2 OCR fine-tuning pipeline built; 1.3 timing-line + crossing integration in progress
 
 ## Setting Up Development Environment
 
 ### Prerequisites
 
-*To be updated as we select technologies*
-
-**Currently Known:**
-- Python 3.8+ (recommended: 3.10)
+**Currently Required:**
+- Python 3.10+
 - pip for package management
 - Git for version control
-
-**Future Requirements** (Phase 1 will determine):
-- OpenCV
-- ML framework (PyTorch or TensorFlow)
-- OCR library
-- Camera drivers
+- ONNX Runtime (for OCR inference)
 
 ### Installation
+```bash
+python -m venv venv
+source venv/bin/activate  # or venv\\Scripts\\activate on Windows
+pip install -r requirements.txt
 
-*To be populated after Phase 1.2*
+# Verify model assets
+python scripts/verify_model_assets.py
+# If needed:
+# python scripts/fetch_model_assets.py --base-url <MODEL_URL>
+```
 
 ### Hardware Setup
 
@@ -92,6 +94,7 @@ See [ROADMAP.md](../ROADMAP.md) for detailed phase breakdown. Current phase info
 
 ### Phase 2+: Automated Testing
 - Unit tests for core components
+- Pipeline integration test (synthetic frames)
 - Integration tests for pipeline
 - Performance benchmarks
 - Field test protocols

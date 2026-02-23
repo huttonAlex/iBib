@@ -50,6 +50,27 @@ Frame (60fps) → Preprocess → Bib Detect (YOLOv8) → OCR (PaddleOCR) → Tra
 ### Jetson Access
 - **SSH**: `ssh alex@192.168.1.169`
 - **Repo path**: `/home/alex/pointcam`
+- **Python**: `venv/bin/python` (always use the venv, not system Python)
+
+### Running Benchmarks on the Jetson
+Long-running pipeline benchmarks (~2 hours) should be launched via `nohup` on the Jetson, then monitored periodically — never run directly as a blocking SSH command or background bash task (SSH will timeout and lose output).
+
+```bash
+# Launch on Jetson
+ssh alex@192.168.1.169 "cd /home/alex/pointcam && nohup venv/bin/python scripts/test_video_pipeline.py REC-0006-A.mp4 --no-video --bib-range 2-3000 --crossing-mode zone --placement right --ocr parseq > /tmp/runN.log 2>&1 &"
+
+# Monitor progress periodically
+ssh alex@192.168.1.169 "wc -l /home/alex/pointcam/runs/pipeline_test/REC-0006-A_crossings.csv; ps aux | grep test_video | grep -v grep | wc -l"
+
+# Check if finished (process count = 0), then get results
+ssh alex@192.168.1.169 "tail -50 /tmp/runN.log"
+
+# Copy results locally for scoring
+scp alex@192.168.1.169:/home/alex/pointcam/runs/pipeline_test/REC-0006-A_crossings.csv pipeline_crossings_runN.csv
+```
+
+### Scoring Against Ground Truth
+Ground truth: `C:\Users\alex\Downloads\5k-run-walk-overall-results-20260214163650-0500.csv` (UTF-16, tab-separated, 2,622 finishers). Estimated ~933 visible finishers in REC-0006-A.mp4.
 
 ## Key Technical Patterns
 

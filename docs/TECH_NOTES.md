@@ -181,6 +181,121 @@ For each approach, measure on the Giants 5K test video (REC-0006-A, 480 finisher
 
 ---
 
+## 2026-02-19: Same-Frame Bib-Person Containment Recovery (Runs 13, 13b, 13c)
+
+### Motivation
+
+Run 12's retroactive recovery compared bib positions at time T1 to person positions at time T2 — these can be hundreds of pixels apart in a head-on camera even though the bib was *inside* the person's bounding box at some earlier point. Of 282 association failures identified in ceiling analysis, only 10 were recovered.
+
+**Core insight**: If a bib was physically inside a person's bounding box at the same moment in time, that's a near-certain association — regardless of where either is later.
+
+### Changes
+
+**New data structure** — `bib_overlapped_persons: Dict[int, set]` records which person tracks each bib was ever spatially inside, updated every frame with O(P×B) containment checks (~50 per frame, negligible cost).
+
+**Co-occurrence recovery** — At emission time for UNKNOWN persons, instead of comparing stale first/last positions across different time points (retroactive recovery), look up verified same-frame containment records from `bib_overlapped_persons`.
+
+**Three iterations tested:**
+
+| Variant | Description |
+|---------|-------------|
+| **Run 13** | Full approach: cross-track bridging (find related fragmented tracks via temporal+spatial proximity, 500px margin) + containment lookup |
+| **Run 13b** | Direct containment only: `related_pids = {pid}` (no bridging) + position-based fallback |
+| **Run 13c** | Direct containment + uniqueness filter: skip bibs that overlapped >3 person tracks (crowd noise) |
+
+### Results (scored against official race results, 2,622 finishers)
+
+| Metric | Run 12 | Run 13 | Run 13b | **Run 13c** |
+|--------|--------|--------|---------|-------------|
+| Recall (visible, ~933) | 63.8% (595/933) | 61.6% (575/933) | 64.0% (597/933) | **64.5% (602/933)** |
+| Recall (full race) | 22.7% (595/2622) | 21.9% (575/2622) | 22.8% (597/2622) | **23.0% (602/2622)** |
+| Precision | 96.0% (595/620) | 96.0% (575/599) | 95.8% (597/623) | **95.9% (602/628)** |
+| True positives | 595 | 575 | 597 | **602** |
+| False positives | 25 | 24 | 26 | 26 |
+| Total crossings | 782 | 779 | 779 | 790 |
+| UNKNOWN | 187 (5.1%) | 20 (2.6%) | 40 (5.1%) | 40 (5.1%) |
+| Duplicate bib emissions | — | 120 | 92 | 96 |
+
+### Configuration
+```
+python scripts/test_video_pipeline.py REC-0006-A.mp4 \
+  --no-video --bib-range 2-3000 --crossing-mode zone \
+  --placement right --ocr parseq
+```
+Hardware: Jetson Orin Nano Super, PyTorch models, PARSeq OCR.
+
+### Analysis
+
+**Run 13 (bridging) was harmful**: Cross-track bridging with 500px spatial margin grouped unrelated runners together. Popular bibs (visible for many seconds — e.g., front runners #6, #85, #93) overlapped many person tracks, then bridging spread them further. Result: 120 duplicate bib emissions, -20 TP vs Run 12. The same bib got assigned to multiple crossings, and bib-level dedup couldn't save us because they were different person tracks crossing at different times.
+
+**Run 13b (direct containment only) recovered well**: Dropping bridging and only using direct containment (`pid in person_set`) eliminated the cross-contamination. +2 TP over Run 12 with UNKNOWN recovery from 187→40. The position-based fallback (unchanged from Run 12) handles some fragmented-track cases.
+
+**Run 13c (+ uniqueness filter) is best**: Filtering bibs that overlapped >3 person tracks removes crowd-noise bibs that would cause false duplicates. +7 TP over Run 12, +0.7pp visible recall, precision held at ~96%.
+
+### Key Lessons
+
+1. **Same-frame containment is a strong signal** — recording "bib B was inside person P at frame F" is more reliable than comparing positions across different time points.
+2. **Cross-track bridging is dangerous in dense scenes** — grouping person tracks by spatial proximity causes bib leakage between adjacent runners. The 500px margin that seemed safe for a head-on camera was far too loose.
+3. **Uniqueness filtering prevents popular-bib spray** — bibs visible for many seconds naturally overlap many person bboxes. Filtering these out prevents them from being incorrectly assigned via co-occurrence.
+4. **Remaining bottleneck is not association** — with 40 UNKNOWNs and 96 duplicates remaining, further gains likely require better person tracking (reducing 2.4 tracks/finisher fragmentation) or better bib detection recall, not better recovery heuristics.
+
+---
+
+## 2026-02-17: Bib-to-Person Association Fixes (Run 12)
+
+### Changes
+
+Ceiling analysis revealed 282 ground-truth bibs (30.2% of visible finishers) had valid HIGH/MEDIUM OCR consensus but were never spatially linked to any person track — 100% association failures in `PersistentPersonBibAssociator`.
+
+**Fix 1 — Bbox overlap matching** (`src/pointcam/crossing.py`):
+The frame-by-frame associator only checked if the bib **centroid** was inside the person bbox. If the bib bbox overlapped the person bbox but its center was just outside, no match. Added bib-bbox-to-person-bbox overlap as an alternative: `inside = center_inside or bbox_overlap`.
+
+**Fix 2 — Store first bib track position** (`scripts/test_video_pipeline.py`):
+Previously only `bib_track_last_pos` was stored. In head-on cameras, the bib's last position (near bottom/close) can be hundreds of pixels from where it was first seen (higher up/further away). Added `bib_track_first_pos` and `bib_track_first_frame` to enable multi-point spatial comparison.
+
+**Fix 3 — Enhanced retroactive recovery** (`scripts/test_video_pipeline.py`):
+Replaced the retroactive bib recovery block with a more robust version:
+1. **Full lifetime temporal overlap**: Checks if bib and person lifetimes overlap (with 5s margin), not just one-directional 2s check
+2. **Multi-point spatial comparison**: Compares all combos of (person first/last chest) × (bib first/last pos), uses minimum distance
+3. **Larger search radius**: 400px → 600px
+4. **Per-bib-number aggregation**: Multiple bib tracks may read the same number; if ANY track for "1234" was near a person, use "1234"
+
+### Results (scored against official race results, 2,622 finishers)
+
+| Metric | Run 11b | **Run 12** | Delta |
+|--------|---------|------------|-------|
+| Recall (full race) | 22.3% (585/2622) | **22.7% (595/2622)** | +0.4pp |
+| Recall (visible, ~933) | 62.7% (585/933) | **63.8% (595/933)** | **+1.1pp** |
+| Precision | 96.1% (585/609) | **96.0% (595/620)** | -0.1pp |
+| True positives | 585 | **595** | **+10** |
+| False positives | 24 | 25 | +1 |
+| Total crossings | 819 | 782 | -37 |
+| UNKNOWN (emitted) | 87 (10.6%) | 40 (5.1%) | -47 |
+| Unique bibs emitted | 609 | 620 | +11 |
+| Dedup suppressed | 1,457 | 1,495 | +38 |
+| Edge-rejected | 47,115 | 47,115 | — |
+
+### Configuration
+```
+python scripts/test_video_pipeline.py REC-0006-A.mp4 \
+  --no-video --bib-range 2-3000 --crossing-mode zone \
+  --placement right --ocr parseq
+```
+Hardware: Jetson Orin Nano Super, PyTorch models, PARSeq OCR.
+
+### Analysis
+
+**Modest recall gain (+10 TP)**: The association fixes recovered 10 additional true positives (585→595), raising visible recall from 62.7% to 63.8%. Precision held flat at 96.0% with only 1 additional FP (24→25).
+
+**UNKNOWN rate halved (10.6%→5.1%)**: The enhanced retroactive recovery successfully linked more bib tracks to person tracks at emission time. Emitted UNKNOWNs dropped from 87 to 40 — a 54% reduction. This means more person crossings now get a bib assignment, even if some of those assignments are false positives that cancel out.
+
+**Association is not the primary bottleneck**: Of the 282 lost bibs identified in the ceiling analysis, only ~10 were recovered. The bbox overlap fix and enhanced retroactive recovery help at the margins, but the majority of lost bibs have a deeper issue — the bib detection track and person detection track simply don't co-exist in the same frames with sufficient spatial proximity. This suggests the next gains will come from:
+1. **Better bib detection recall** — detecting bibs in more frames so they overlap with person tracks longer
+2. **Motion-based association** — matching bib and person tracks by co-movement patterns rather than spatial proximity at individual points
+3. **Longer-range temporal association** — linking bib observations from early in a person's approach to the crossing event seconds later
+
+---
+
 ## 2026-02-17: Edge Rejection + Proximity Dedup + Bib Detector v2 (Run 11b)
 
 ### Changes
@@ -1304,11 +1419,38 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | Run 9 | 2026-02-16 | Zone, deferred emission | 1,091 | 431 | 57 | 46.2% | 16.4% | 88.3% | 35.9% |
 | Run 10 | 2026-02-16 | + cross-track seed, REJECT votes | 714 | 375 | 51 | 40.2% | 14.3% | 88.0% | 14.7% |
 | **Run 11b** | **2026-02-17** | **+ edge reject, prox dedup, YOLO v2** | **819** | **585** | **24** | **62.7%** | **22.3%** | **96.1%** | **10.6%** |
+| **Run 12** | **2026-02-17** | **+ bbox overlap assoc, enhanced retro recovery** | **782** | **595** | **25** | **63.8%** | **22.7%** | **96.0%** | **5.1%** |
+| Run 13 | 2026-02-19 | + same-frame containment + cross-track bridging | 779 | 575 | 24 | 61.6% | 21.9% | 96.0% | 2.6% |
+| Run 13b | 2026-02-19 | + same-frame containment (direct only, no bridging) | 779 | 597 | 26 | 64.0% | 22.8% | 95.8% | 5.1% |
+| **Run 13c** | **2026-02-19** | **+ same-frame containment + uniqueness filter (≤3)** | **790** | **602** | **26** | **64.5%** | **23.0%** | **95.9%** | **5.1%** |
 
 **Notes:**
 - Runs 3-4b were scored against a different ground truth (480 bibs from bib_order.txt) and have not been rescored against official results
 - Run 11b uses bib detector v2 (trained on 6,664 images), restored edge rejection, and proximity-aware dedup
+- Run 12 adds bbox overlap matching in associator, first-position tracking for bib tracks, and enhanced retroactive recovery (multi-point spatial, per-bib aggregation)
+- Run 13 added same-frame bib-person containment recording; cross-track bridging caused 120 duplicate emissions and -20 TP (reverted)
+- Run 13c is the best configuration: direct containment + uniqueness filter (skip bibs overlapping >3 person tracks)
 - Visible finisher estimate (~933) based on manual confirmation that bib 2675 (official position 933) appears near the end of the video
+
+### Additional Test: REC-0004-A (Half Marathon, angled view, 4-digit bibs)
+
+**Ground truth**: Official results file `half-marathon-overall-results-20260219122239-0500.csv.txt` (trimmed to **1,400 visible finishers**, bib range 801-7350).
+
+| Run | Date | Config | Crossings | Correct Bibs | FP Bibs | Bib Recall (visible, 1400) | Precision | UNKNOWN% |
+|-----|------|--------|-----------|-------------|---------|--------------------------|-----------|----------|
+| Run 14 | 2026-02-19 | Zone mode, PARSeq, placement=right, bib-range 801-7350, no-video | 656 | 315 | 258 | 22.5% | 55.0% | 5.0% |
+
+**Additional metrics:**
+- Crossing recall (crossings / GT-visible): 656 / 1400 = **46.9%**
+- OCR visibility estimate: **690** GT bibs seen in detections (non-reject consensus) → **49.3%** of GT
+- Conversion from OCR-seen to crossings: **315 / 690 = 45.7%**
+- Duplicate bibs: **38**
+
+**Notes:**
+- **Large bib range (801-7350)** reduces the filtering power of bib validation and raises false positives (precision 55% vs ~96% on REC-0006-A).
+- **Angled camera + 4-digit bibs** likely reduce detection/OCR coverage (only 49% of GT seen by OCR at all).
+- **Association remains a bottleneck**: fewer than half of GT bibs seen by OCR make it to a crossing.
+- **Compared to REC-0006-A Run 13c**: 22.5% visible bib recall vs 64.5%, precision 55.0% vs 95.9%.
 
 ### Phase 2 Baselines
 *To be populated during Phase 2*
@@ -1342,3 +1484,9 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | E018 | 2026-02-16 | 1.4 | Cross-track bib + UNKNOWN recovery Run 10 | 29.0% recall (-3.9pp), 14.7% UNKNOWN (-21.2pp) | UNKNOWN fix works; recall regressed from dedup cascade |
 | E019 | 2026-02-17 | 1.4 | Bib detector v2 retraining (6,664 images) | mAP50=0.978, mAP50-95=0.824, R=0.934 | 32x more data, 5 events, early stop epoch 87 |
 | E020 | 2026-02-17 | 1.4 | Edge rejection + proximity dedup + v2 detector Run 11b | 22.3% recall, 96.1% precision (vs 2622 GT) | +36% more correct bibs vs Run 9; FPs down 57→24; scored against official results |
+| E021 | 2026-02-17 | 1.4 | Bbox overlap assoc + enhanced retroactive recovery Run 12 | 22.7% recall, 96.0% precision (vs 2622 GT) | +10 TP, +1 FP; UNKNOWN 10.6%→5.1%; association not the primary bottleneck |
+| E022 | 2026-02-19 | 1.4 | Same-frame containment + bridging Run 13 | 21.9% recall, 96.0% precision | Bridging harmful: 120 duplicate emissions, -20 TP from cross-contamination |
+| E023 | 2026-02-19 | 1.4 | Direct containment (no bridging) Run 13b | 22.8% recall, 95.8% precision | +2 TP vs Run 12; bridging removed, direct containment works |
+| E024 | 2026-02-19 | 1.4 | Direct containment + uniqueness filter Run 13c | 23.0% recall, 95.9% precision | +7 TP vs Run 12; skip bibs overlapping >3 person tracks |
+| E025 | 2026-02-19 | 1.4 | REC-0004-A half marathon (angled, 4-digit bibs) | 22.5% visible bib recall, 55.0% precision | GT trimmed to visible finishers (1,400). OCR sees ~49% of GT; large bib range inflates FP; association still bottleneck |
+| E026 | 2026-02-19 | 1.4 | REC-0004-A frame extraction for detector data | Frames extracted for labeling | Use `scripts/extract_video_frames.py` → `data/unlabeled_rec0004a/` (uniform + top-k dense frames) |

@@ -737,6 +737,37 @@ crops now available, fine-tuning a specialized model is feasible and likely to e
 
 ---
 
+### DD-023: Modal for Photo Tagging GPU Compute
+
+**Decision**: Use Modal (modal.com) as the serverless GPU platform for the photo tagging service that matches race photos to participants via bib detection + OCR.
+
+**Context**: The results service already receives race photos uploaded to R2 storage. We want to automatically detect bib numbers in photos and tag them to participant results. This requires GPU inference (YOLOv8 detection + PARSeq OCR) but the workload is bursty — thousands of photos on race day, zero the rest of the week.
+
+**Alternatives Considered**:
+1. **Vast.ai** — Cheapest raw GPU-hours (~$0.10-0.15/hr for T4) but 3-5 min cold start, marketplace reliability concerns (renting random community GPUs), not suitable for production request/response workloads
+2. **RunPod Serverless** — Good middle ground (~$0.20-0.40/hr), fast cold starts (~200ms), but more Docker/infra setup work
+3. **Modal** — Per-second billing (~$0.59/hr for T4), sub-second cold starts, Python-native deployment (no Dockerfile), scales to zero, runs on vetted datacenter hardware
+4. **Self-hosted GPU on VPS** — Dedicated GPU instances are expensive 24/7 for a bursty workload
+
+**Rationale**:
+- Per-second billing with scale-to-zero is ideal for bursty race-day workloads — cost per photo is ~$0.0005 (under a tenth of a cent)
+- A typical 5K race (5,000 photos) costs ~$1.65 total on Modal T4
+- Python-native deployment means the photo tagging worker is just a decorated class, no Docker infra to maintain
+- Sub-second cold starts mean photos get processed promptly even after idle periods
+- Vetted datacenter hardware eliminates marketplace reliability risk
+- $30/mo free credits cover low-volume testing
+- Easy migration path to RunPod Serverless if costs become a concern at scale
+
+**Consequences**:
+- Vendor dependency on Modal for GPU compute (mitigated: ONNX models are portable)
+- Need to package model weights for Modal's container image
+- VPS remains the control plane — R2 events trigger the VPS, which dispatches to Modal
+
+**Status**: Accepted
+**Date**: 2026-02-22
+
+---
+
 ## Pending Decisions
 
 ### DD-P01: Multi-Camera Coordination (Future)

@@ -33,10 +33,12 @@ A computer vision-based race timing backup system that uses cameras to detect ra
 ## Current Status
 
 **Phase**: 1 - Proof of Concept
-**Status**: Documentation complete, ready for development
+**Status**: Phase 1.2 OCR fine-tuning pipeline built; Phase 1.3 timing-line + crossing pipeline integrated and under tuning (last update: 2026-02-14)
 
 ### Available Assets
-- 1000 tagged bib images (COCO format) for training
+- 10,853 verified bib crops from 4 events + 1,000 tagged COCO images
+- Fine-tuned OCR ONNX models (CRNN + PARSeq) in `models/`
+- YOLOv8 bib detector v2 weights in `models/`
 - CTP01 protocol documentation
 
 ## Documentation
@@ -51,6 +53,7 @@ A computer vision-based race timing backup system that uses cameras to detect ra
 - [docs/INTEGRATION_PROTOCOL.md](docs/INTEGRATION_PROTOCOL.md) - CTP01 protocol implementation
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) - All configuration options
 - [docs/DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md) - Developer handbook
+- [docs/MODEL_ASSETS.md](docs/MODEL_ASSETS.md) - Pinned model assets and verification
 - [docs/TECH_NOTES.md](docs/TECH_NOTES.md) - Technical findings and experiments
 
 ## Hardware (Planned)
@@ -105,12 +108,11 @@ See [ROADMAP.md](ROADMAP.md) for detailed milestones and deliverables.
 
 ## Getting Started (Development)
 
-*Setup instructions to be added in Phase 1*
-
 ### Prerequisites (Expected)
 - Python 3.10+
 - CUDA-capable GPU (for training) or Jetson device
-- 1000-image COCO dataset (available)
+- 10k+ bib crop dataset (available)
+- ONNX Runtime for OCR inference (see `docs/MODEL_ASSETS.md`)
 
 ### Quick Start
 ```bash
@@ -118,12 +120,17 @@ See [ROADMAP.md](ROADMAP.md) for detailed milestones and deliverables.
 git clone <repo-url>
 cd pointCam
 
-# Setup environment (TBD)
+# Setup environment
 python -m venv venv
 source venv/bin/activate  # or venv\Scripts\activate on Windows
-pip install -r requirements.txt  # TBD
+pip install -r requirements.txt
 
-# Run tests (TBD)
+# Verify/download pinned model assets
+python scripts/verify_model_assets.py
+# If needed:
+# python scripts/fetch_model_assets.py --base-url <MODEL_URL>
+
+# Run tests
 pytest tests/
 ```
 

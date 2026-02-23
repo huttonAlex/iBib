@@ -20,8 +20,9 @@ def main():
         default="yolov8n.pt",
         help="Base model (yolov8n/s/m/l/x.pt)",
     )
+    parser.add_argument("--name", type=str, default="bib_detector", help="Run name")
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--batch", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch", type=int, default=32, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size")
     parser.add_argument("--device", type=str, default="", help="Device (cuda:0, cpu, etc)")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
@@ -46,7 +47,7 @@ def main():
         imgsz=args.imgsz,
         device=args.device if args.device else None,
         project=str(project_root / "runs" / "detect"),
-        name="bib_detector",
+        name=args.name,
         exist_ok=True,
         resume=args.resume,
         # Augmentation settings suitable for bib detection
@@ -61,7 +62,7 @@ def main():
         mosaic=1.0,
         mixup=0.0,
         # Performance
-        workers=4,
+        workers=8,
         patience=20,  # Early stopping patience
         save=True,
         save_period=10,
@@ -70,7 +71,7 @@ def main():
     )
 
     print("\nTraining complete!")
-    print(f"Best model saved to: {project_root / 'runs' / 'detect' / 'bib_detector' / 'weights' / 'best.pt'}")
+    print(f"Best model saved to: {project_root / 'runs' / 'detect' / args.name / 'weights' / 'best.pt'}")
 
     return results
 

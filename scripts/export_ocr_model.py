@@ -6,11 +6,13 @@ and measures ONNX Runtime inference speed.
 
 Usage:
     python scripts/export_ocr_model.py --model crnn --checkpoint runs/ocr_finetune/crnn_v1/best.pt
-    python scripts/export_ocr_model.py --model parseq --checkpoint runs/ocr_finetune/parseq_v1/best.pt
+    python scripts/export_ocr_model.py --model parseq --checkpoint runs/ocr_finetune/parseq_v1/best.pt \\
+        --tokenizer-out models/ocr_parseq.tokenizer.json
 """
 
 import argparse
 import csv
+import json
 import sys
 import time
 from pathlib import Path
@@ -57,7 +59,52 @@ def export_crnn(checkpoint_path: str, output_path: str):
     return model, dummy
 
 
-def export_parseq(checkpoint_path: str, output_path: str):
+def _find_token_id(vocab: list, candidates: list[str]) -> int | None:
+    for token in candidates:
+        if token in vocab:
+            return vocab.index(token)
+    return None
+
+
+def _extract_vocab(tokenizer):
+    if hasattr(tokenizer, "itos") and tokenizer.itos:
+        return list(tokenizer.itos)
+    if hasattr(tokenizer, "_itos") and tokenizer._itos:
+        return list(tokenizer._itos)
+    if hasattr(tokenizer, "charset") and tokenizer.charset:
+        return list(tokenizer.charset)
+    return None
+
+
+def save_parseq_tokenizer(tokenizer, output_path: str) -> None:
+    vocab = _extract_vocab(tokenizer)
+    if vocab is None:
+        raise ValueError("Unable to extract tokenizer vocab")
+
+    def _get_id(attr_names: list[str], token_candidates: list[str]) -> int | None:
+        for name in attr_names:
+            if hasattr(tokenizer, name):
+                return getattr(tokenizer, name)
+        return _find_token_id(vocab, token_candidates)
+
+    bos_id = _get_id(["bos_id", "bos_token_id"], ["<bos>", "<s>", "<sos>", "<BOS>"])
+    eos_id = _get_id(["eos_id", "eos_token_id"], ["<eos>", "</s>", "<EOS>"])
+    pad_id = _get_id(["pad_id", "pad_token_id"], ["<pad>", "<PAD>"])
+
+    payload = {
+        "vocab": vocab,
+        "bos_id": bos_id,
+        "eos_id": eos_id,
+        "pad_id": pad_id,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"  PARSeq tokenizer saved to {output_path}")
+
+
+def export_parseq(checkpoint_path: str, output_path: str, tokenizer_out: str | None):
     """Export PARSeq model to ONNX.
 
     PARSeq uses an autoregressive decoder with data-dependent control flow,
@@ -88,6 +135,8 @@ def export_parseq(checkpoint_path: str, output_path: str):
         },
         dynamo=False,
     )
+    if tokenizer_out:
+        save_parseq_tokenizer(model.tokenizer, tokenizer_out)
     print(f"  PARSeq exported to {output_path}")
     return model, dummy
 
@@ -282,6 +331,12 @@ def main():
         help="Output ONNX path (default: models/ocr_{model}.onnx)",
     )
     parser.add_argument(
+        "--tokenizer-out",
+        type=str,
+        default=None,
+        help="Output path for PARSeq tokenizer JSON (default: <onnx>.tokenizer.json)",
+    )
+    parser.add_argument(
         "--dataset", type=str, default="data/ocr_dataset",
         help="Path to dataset for accuracy verification (default: data/ocr_dataset)",
     )
@@ -310,13 +365,24 @@ def main():
     print("=" * 70)
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"  Output:     {output_path}")
+    tokenizer_out = None
+    if args.model == "parseq":
+        tokenizer_out = args.tokenizer_out
+        if tokenizer_out is None:
+            tokenizer_out = str(output_path.with_suffix(".tokenizer.json"))
+        else:
+            if not Path(tokenizer_out).is_absolute():
+                tokenizer_out = str(project_root / tokenizer_out)
+        print(f"  Tokenizer:  {tokenizer_out}")
 
     # Export
     print("\n[1/4] Exporting to ONNX...")
     if args.model == "crnn":
         pytorch_model, dummy = export_crnn(checkpoint_path, str(output_path))
     elif args.model == "parseq":
-        pytorch_model, dummy = export_parseq(checkpoint_path, str(output_path))
+        pytorch_model, dummy = export_parseq(
+            checkpoint_path, str(output_path), tokenizer_out
+        )
 
     # Verify ONNX structure
     print("\n[2/4] Verifying ONNX model...")
