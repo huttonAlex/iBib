@@ -143,6 +143,110 @@ class CentroidTracker:
         return {oid: (self.objects[oid], self.bboxes[oid]) for oid in self.objects}
 
 
+class ByteTrackAdapter:
+    """ByteTrack-based tracker matching the CentroidTracker interface.
+
+    Uses Roboflow's ``supervision.ByteTrack`` (Kalman filter + two-stage
+    association) for more robust tracking when runners overlap, while
+    returning the same ``{id: (centroid, bbox)}`` dict so downstream
+    code is unchanged.
+
+    Args:
+        max_disappeared: ``lost_track_buffer`` — frames before a lost
+            track is dropped (maps to ByteTrack's internal buffer).
+        frame_rate: Video frame rate (used by ByteTrack's Kalman filter).
+        track_activation_threshold: Minimum confidence for first-stage
+            matching.  Since pose detections don't carry per-detection
+            confidence we default to 0.25 (ByteTrack's two-stage matching
+            still activates via Kalman scoring).
+    """
+
+    def __init__(
+        self,
+        max_disappeared: int = 30,
+        max_distance: float = 150.0,
+        track_activation_threshold: float = 0.25,
+        frame_rate: int = 30,
+    ):
+        import supervision as sv
+
+        self._tracker = sv.ByteTrack(
+            track_activation_threshold=track_activation_threshold,
+            lost_track_buffer=max_disappeared,
+            frame_rate=frame_rate,
+        )
+        self._next_id = 0
+        # Map ByteTrack internal IDs → our stable external IDs
+        self._id_map: Dict[int, int] = {}
+
+    @property
+    def next_id(self) -> int:
+        """Total unique IDs assigned (for stats reporting)."""
+        return self._next_id
+
+    def update(
+        self,
+        detections: List[Tuple[int, int, int, int]],
+        centroids: Optional[List[Tuple[float, float]]] = None,
+    ) -> Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]]:
+        """Update tracker with new detections.
+
+        Args:
+            detections: List of (x1, y1, x2, y2) bounding boxes.
+            centroids: Optional pre-computed centroids (e.g. chest points).
+                If provided, must be same length as *detections*.  When
+                ``None``, centroids are computed as bbox centers.
+
+        Returns:
+            Dict of {track_id: (centroid, bbox)}.
+        """
+        import supervision as sv
+
+        if len(detections) == 0:
+            sv_dets = sv.Detections.empty()
+            sv_dets = self._tracker.update_with_detections(sv_dets)
+            return {}
+
+        xyxy = np.array(detections, dtype=np.float32)
+        confidence = np.ones(len(detections), dtype=np.float32)
+
+        # Pass centroids through Detections.data so they survive
+        # ByteTrack's internal reordering/filtering.
+        data: Dict = {}
+        if centroids is not None:
+            data["centroids"] = np.array(centroids, dtype=np.float32)
+
+        sv_dets = sv.Detections(xyxy=xyxy, confidence=confidence, data=data)
+        sv_dets = self._tracker.update_with_detections(sv_dets)
+
+        result: Dict[int, Tuple[Tuple[float, float], Tuple[int, int, int, int]]] = {}
+
+        if sv_dets.tracker_id is None:
+            return result
+
+        has_centroids = "centroids" in sv_dets.data and len(sv_dets.data["centroids"]) > 0
+
+        for i, bt_id in enumerate(sv_dets.tracker_id):
+            bt_id = int(bt_id)
+            if bt_id not in self._id_map:
+                self._id_map[bt_id] = self._next_id
+                self._next_id += 1
+            ext_id = self._id_map[bt_id]
+
+            x1, y1, x2, y2 = sv_dets.xyxy[i]
+            bbox = (int(x1), int(y1), int(x2), int(y2))
+
+            if has_centroids:
+                cx, cy = sv_dets.data["centroids"][i]
+                centroid = (float(cx), float(cy))
+            else:
+                centroid = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+            result[ext_id] = (centroid, bbox)
+
+        return result
+
+
 # ---------------------------------------------------------------------------
 # PersonDetection (dataclass)
 # ---------------------------------------------------------------------------

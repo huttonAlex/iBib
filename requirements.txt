@@ -8,6 +8,7 @@ paddleocr>=2.7.0            # PaddleOCR
 opencv-python>=4.8.0        # OpenCV
 numpy>=1.24.0               # Numerical computing
 onnxruntime>=1.15.0         # ONNX Runtime (OCR inference)
+supervision>=0.25.0         # ByteTrack multi-object tracker
 
 # Dataset handling
 pycocotools>=2.0.0          # COCO format tools

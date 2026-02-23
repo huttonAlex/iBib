@@ -18,6 +18,7 @@ import numpy as np
 
 from pointcam.crossing import (
     BibCrossingDeduplicator,
+    ByteTrackAdapter,
     CentroidTracker,
     CrossingDetector,
     CrossingEvent,
@@ -392,7 +393,7 @@ def process_frames(
         if config.enable_person_detect or config.crossing_mode == "zone":
             if pose_detector is None:
                 raise ValueError("pose_detector required when person detection enabled")
-            person_tracker = CentroidTracker(max_disappeared=20, max_distance=150)
+            person_tracker = ByteTrackAdapter(max_disappeared=20, frame_rate=int(fps))
 
             expected_digits = None
             if bib_validator:
