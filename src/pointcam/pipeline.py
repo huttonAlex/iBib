@@ -343,6 +343,11 @@ def process_frames(
     consensus_ttl = int(30 * fps)
     all_consensus: Dict[int, Tuple[str, float, str]] = {}
 
+    # Track-frequency filter: suppress bibs that appear on too many bib tracks
+    # (phantom reads from bib design elements, systematic partial reads, etc.)
+    bib_consensus_tracks: Dict[str, set] = {}  # bib_number -> set of bib track IDs
+    max_bib_tracks = 5  # bibs on more than this many tracks are suppressed
+
     bib_track_last_pos: Dict[int, Tuple[float, float]] = {}
     bib_track_last_frame: Dict[int, int] = {}
     bib_track_first_pos: Dict[int, Tuple[float, float]] = {}
@@ -567,6 +572,7 @@ def process_frames(
                 classified.level.value,
             )
             final_consensus_frame[track_id] = frame_idx
+            bib_consensus_tracks.setdefault(consensus_number, set()).add(track_id)
             all_consensus[track_id] = final_consensus[track_id]
 
             if classified.needs_review:
@@ -653,7 +659,13 @@ def process_frames(
             p_chests = [d.chest_point for d in person_dets]
             person_tracked = person_tracker.update(p_bboxes, centroids=p_chests)
 
-            person_bib_assoc.update(person_tracked, tracked, final_consensus, frame_idx)
+            # Filter out phantom bibs (appearing on too many bib tracks)
+            filtered_consensus = {
+                tid: (num, conf, level)
+                for tid, (num, conf, level) in final_consensus.items()
+                if len(bib_consensus_tracks.get(num, set())) <= max_bib_tracks
+            }
+            person_bib_assoc.update(person_tracked, tracked, filtered_consensus, frame_idx)
 
             if person_tracked and tracked:
                 for pid, (p_centroid, p_bbox) in person_tracked.items():
@@ -735,12 +747,19 @@ def process_frames(
                     best_bib = None
                     best_conf = 0.0
 
+                    def _is_phantom(num: str) -> bool:
+                        return len(bib_consensus_tracks.get(num, set())) > max_bib_tracks
+
                     for bid, (b_centroid, b_bbox) in tracked.items():
                         bcx, bcy = b_centroid
                         if px1 <= bcx <= px2 and py1 <= bcy <= py2:
                             if bid in final_consensus:
                                 fc_number, fc_conf, fc_level = final_consensus[bid]
-                                if fc_level in ("high", "medium") and fc_conf > best_conf:
+                                if (
+                                    fc_level in ("high", "medium")
+                                    and fc_conf > best_conf
+                                    and not _is_phantom(fc_number)
+                                ):
                                     best_bib = fc_number
                                     best_conf = fc_conf
 
@@ -750,7 +769,11 @@ def process_frames(
                             if (px1 - margin) <= bcx <= (px2 + margin) and py1 <= bcy <= py2:
                                 if bid in final_consensus:
                                     fc_number, fc_conf, fc_level = final_consensus[bid]
-                                    if fc_level == "high" and fc_conf > best_conf:
+                                    if (
+                                        fc_level == "high"
+                                        and fc_conf > best_conf
+                                        and not _is_phantom(fc_number)
+                                    ):
                                         best_bib = fc_number
                                         best_conf = fc_conf
 
@@ -766,6 +789,8 @@ def process_frames(
                                 continue
                             bc_number, bc_conf, bc_level = all_consensus[bid]
                             if bc_level not in ("high", "medium"):
+                                continue
+                            if _is_phantom(bc_number):
                                 continue
                             prev = cooccurrence_candidates.get(bc_number, 0.0)
                             if bc_conf > prev:
@@ -789,6 +814,8 @@ def process_frames(
 
                         for bid, (bc_number, bc_conf, bc_level) in all_consensus.items():
                             if bc_level not in ("high", "medium"):
+                                continue
+                            if _is_phantom(bc_number):
                                 continue
                             bib_first = bib_track_first_frame.get(bid)
                             bib_last = bib_track_last_frame.get(bid)

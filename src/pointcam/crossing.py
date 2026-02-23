@@ -550,8 +550,10 @@ class PersistentPersonBibAssociator:
     Vote weights by confidence level:
         HIGH: 3, MEDIUM: 2, LOW: 1, REJECT: 0.5 (low but non-zero).
 
-    Short bib numbers (fewer digits than expected) receive halved vote weight
-    when ``expected_digit_counts`` is provided.
+    Short bib numbers receive reduced vote weight based on how far below
+    the typical (most common) digit count they are:
+        gap >= 2 digits: 0.1x weight (e.g. 1-digit when most bibs are 3-4 digits)
+        gap == 1 digit:  0.25x weight (e.g. 2-digit when most bibs are 3-4 digits)
 
     Args:
         max_distance: Max pixel distance for bib-center-to-person-bbox fallback.
@@ -559,7 +561,7 @@ class PersistentPersonBibAssociator:
         min_votes: Minimum weighted votes for the winning bib to be emitted.
         min_confidence: Minimum vote fraction for the winning bib (0.0-1.0).
         expected_digit_counts: Set of expected digit counts (e.g. {3, 4}).
-            Bibs with fewer digits than the minimum in this set get halved weight.
+            The maximum is used as the "typical" length for short-bib penalty.
     """
 
     # Weighted votes per confidence level
@@ -578,10 +580,10 @@ class PersistentPersonBibAssociator:
         self.min_votes = min_votes
         self.min_confidence = min_confidence
         self.expected_digit_counts = expected_digit_counts
-        # Minimum expected digit count for short-bib penalty
-        self._min_expected_digits: Optional[int] = None
+        # Typical (max) expected digit count for short-bib penalty
+        self._typical_digits: Optional[int] = None
         if expected_digit_counts:
-            self._min_expected_digits = min(expected_digit_counts)
+            self._typical_digits = max(expected_digit_counts)
         # person_track_id → {bib_number → weighted_vote_count}
         self._votes: Dict[int, Dict[str, float]] = {}
         # person_track_id → last_frame_seen
@@ -598,12 +600,13 @@ class PersistentPersonBibAssociator:
         if base == 0:
             return 0.0
         weight = float(base)
-        # Short-bib penalty: halve weight for bibs shorter than expected
-        if (
-            self._min_expected_digits is not None
-            and len(bib_number) < self._min_expected_digits
-        ):
-            weight *= 0.5
+        # Short-bib penalty: scale down bibs shorter than typical length
+        if self._typical_digits is not None:
+            digit_gap = self._typical_digits - len(bib_number)
+            if digit_gap >= 2:
+                weight *= 0.1
+            elif digit_gap == 1:
+                weight *= 0.25
         return weight
 
     def update(
