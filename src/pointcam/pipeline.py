@@ -1033,7 +1033,7 @@ def process_frames(
 
         unknown_events = [e for e in all_crossing_events if e.bib_number == "UNKNOWN"]
         temporal_margin = 15.0 * fps  # 15 seconds
-        spatial_margin = 600  # pixels
+        spatial_margin = 1000  # pixels
 
         for event in unknown_events:
             best_bib = None

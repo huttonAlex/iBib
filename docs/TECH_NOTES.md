@@ -22,6 +22,76 @@ Entries are organized by phase and date. Each entry should include:
 
 ---
 
+## 2026-02-24: Pipeline Funnel Diagnostics & Association Fixes (Runs 14-19)
+
+### Pipeline Funnel Analysis
+
+Diagnostic analysis of Run 14 (634 TP, 95.8% precision, 68.0% visible recall) revealed the
+primary bottleneck is **bib-to-person association**, not detection or OCR.
+
+**Bib visibility funnel (vs 2,622 GT finishers):**
+```
+2,622 GT bibs
+ └─ 1,300 seen by OCR at any confidence
+     └─ 1,170 seen at HIGH/MEDIUM confidence
+         └─ 634 make it to crossings (TP)
+              ── 536 lost between confident OCR read and crossing emission
+```
+
+**Root cause: phantom bib reads consuming 21.6% of high-confidence votes.**
+
+| Phantom bib | Bib tracks | Likely source |
+|---|---|---|
+| "85" | 298 | Design element on every bib (year/logo) |
+| "1111" | 36 | Repeated pattern |
+| "111" | 32 | Partial read |
+| "6" | 31 | Single digit from many bibs |
+
+Real bibs appear on 1-3 tracks. Anything on 6+ is noise. These phantom reads dilute voting
+for real bibs, causing person tracks to cross as UNKNOWN or with the wrong bib.
+
+### Fixes Applied
+
+**1. Track-frequency filter** (Run 17): Suppress bibs appearing on >5 bib tracks from
+association voting and all recovery paths. Result: +39 TP, -4 FP.
+
+**2. Stronger short-bib penalty** (Run 17): Scale vote weight by digit gap from typical
+(max) expected length. For bibs 2-3000 (typical=4 digits): 1-2 digit → 0.1x, 3 digit → 0.25x.
+
+**3. Cold-start phantom check** (Run 18): Retroactively suppress bibs at crossing emission
+time if they exceeded the track-frequency threshold after early votes were cast.
+
+**4. Post-processing UNKNOWN resolution** (Run 18-19): After the main loop, match UNKNOWN
+crossings to unmatched bibs using temporal+spatial proximity of all sampled bib observations.
+
+### Run Comparison
+
+| Metric | Run 14 | Run 17 | Run 19 |
+|---|---|---|---|
+| True positives | 634 | 673 | 679 |
+| False positives | 28 | 24 | 25 |
+| Precision | 95.8% | 96.6% | 96.4% |
+| Visible recall | 68.0% | 72.1% | 72.8% |
+| Person tracks | 2,279 | 2,279 | 2,279 |
+| UNKNOWN crossings | 68 | 96 | 110 |
+| Post-proc resolved | - | - | 6 |
+
+### Remaining Opportunity (from Run 17 diagnostics)
+
+- **125 strong lost bibs**: 10+ HM reads, good OCR signal, association failed
+- **332 moderate lost bibs**: 1-9 HM reads, mostly single-track (brief glimpses)
+- **84 UNKNOWN crossings** with an available GT bib nearby temporally
+- Spatial matching is the primary limiter for post-proc (bib position when readable vs person position when crossing)
+
+### Key Lessons
+
+- **ByteTrack's IoU matching is worse than centroid distance** for tall/thin overlapping runner bboxes. Kalman filter predictions don't help when the pose detector already provides stable detections.
+- **Increasing max_disappeared without reducing max_distance** causes stale tracks to reclaim unrelated runners, hurting recall.
+- **Phantom reads from bib design elements** are a major source of vote contamination. Auto-detecting these via track frequency is effective.
+- **The association gap is fundamentally spatial**: bibs are readable when runners approach the camera but crossings fire when they've moved past. Post-processing with wider margins helps but can't fully bridge this gap.
+
+---
+
 ## 2026-02-17: Bib Detector v2 Retraining & Pipeline Improvement Roadmap
 
 ### Bib Detector v2 — Training Results
@@ -178,6 +248,65 @@ For each approach, measure on the Giants 5K test video (REC-0006-A, 480 finisher
 - Training plots: `runs/detect/bib_detector/results.png`
 - Confusion matrix: `runs/detect/bib_detector/confusion_matrix.png`
 - Full metrics CSV: `models/bib_detector_v2_results.csv`
+
+---
+
+## 2026-02-23: Bib Detector v3 Benchmark (Run 14)
+
+### Objective
+
+Benchmark the retrained YOLOv8n bib detector (v3) against v2 using the standard REC-0006-A test, with identical pipeline configuration to Run 13c.
+
+### Configuration
+```
+python scripts/test_video_pipeline.py REC-0006-A.mp4 \
+  --no-video --bib-range 2-3000 --crossing-mode zone \
+  --placement right --ocr parseq --ocr-backend pytorch \
+  --detector models/bib_detector_v3.pt
+```
+Hardware: Jetson Orin Nano Super, PyTorch PARSeq OCR (CUDA), YOLOv8n v3 detector.
+
+### Results (scored against official race results, 2,622 finishers)
+
+| Metric | Run 13c (v2 detector) | **Run 14 (v3 detector)** | Change |
+|--------|----------------------|--------------------------|--------|
+| Recall (visible, ~933) | 64.5% (602/933) | **68.0% (634/933)** | **+3.5pp** |
+| Recall (full race) | 23.0% (602/2622) | **24.2% (634/2622)** | **+1.2pp** |
+| Precision | 95.9% (602/628) | **95.8% (634/662)** | -0.1pp |
+| True positives | 602 | **634** | **+32** |
+| False positives | 26 | 28 | +2 |
+| Total crossings | 790 | 846 | +56 |
+| UNKNOWN | 40 (5.1%) | 78 (9.2%) | +38 |
+| Unique bibs emitted | 628 | 662 | +34 |
+| Dedup suppressed | — | 1,431 | — |
+| Person tracks | — | 2,279 | — |
+
+### Pipeline Statistics
+- Frames processed: 54,002
+- Total detections: 43,751
+- Edge-rejected: 26,525
+- Quality-rejected: 28,515
+- OCR stable-track skips: 89,454
+- Avg detection time: 37.4 ms/frame
+- Avg OCR time: 50.2 ms/detection
+
+### Analysis
+
+**+32 true positives (+5.3% relative improvement)**: The v3 detector finds more bibs, and those additional detections translate directly into correct identifications. Precision held at ~96%, confirming the new detections are real finishers, not noise.
+
+**UNKNOWN crossings increased 40→78**: The v3 detector is finding more crossings where OCR still can't read the bib. This means detection recall improved more than end-to-end bib recall — the detector is surfacing runners that OCR/association can't yet handle.
+
+**Remaining FPs are the same pattern**: The 28 false positives are mostly short partial reads (1, 2, 3, 15, 25) and repeated-digit OCR hallucinations (111, 1111, 2121) — the same as Run 13c. The detector isn't introducing new FP patterns.
+
+**The detector is no longer the primary bottleneck**: With 68% visible recall and 96% precision, the ~299 missed visible finishers are now primarily limited by:
+1. **OCR failures** — bibs detected but not readable (small, blurry, occluded)
+2. **Person tracking fragmentation** — 2,279 tracks for ~933 finishers (2.4x fragmentation) means association must handle multi-track identities
+3. **Association gaps** — bibs read correctly but not linked to the crossing person
+
+### Files
+- Model: `models/bib_detector_v3.pt`
+- Results: `pipeline_crossings_run14.csv`
+- Log: `/tmp/run14.log` (on Jetson)
 
 ---
 
@@ -1423,6 +1552,7 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | Run 13 | 2026-02-19 | + same-frame containment + cross-track bridging | 779 | 575 | 24 | 61.6% | 21.9% | 96.0% | 2.6% |
 | Run 13b | 2026-02-19 | + same-frame containment (direct only, no bridging) | 779 | 597 | 26 | 64.0% | 22.8% | 95.8% | 5.1% |
 | **Run 13c** | **2026-02-19** | **+ same-frame containment + uniqueness filter (≤3)** | **790** | **602** | **26** | **64.5%** | **23.0%** | **95.9%** | **5.1%** |
+| **Run 14** | **2026-02-23** | **YOLO v3 detector (retrained weights)** | **846** | **634** | **28** | **68.0%** | **24.2%** | **95.8%** | **9.2%** |
 
 **Notes:**
 - Runs 3-4b were scored against a different ground truth (480 bibs from bib_order.txt) and have not been rescored against official results
@@ -1430,6 +1560,7 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 - Run 12 adds bbox overlap matching in associator, first-position tracking for bib tracks, and enhanced retroactive recovery (multi-point spatial, per-bib aggregation)
 - Run 13 added same-frame bib-person containment recording; cross-track bridging caused 120 duplicate emissions and -20 TP (reverted)
 - Run 13c is the best configuration: direct containment + uniqueness filter (skip bibs overlapping >3 person tracks)
+- Run 14 uses bib detector v3 (retrained weights); UNKNOWN increased because v3 finds more crossings where OCR can't read the bib
 - Visible finisher estimate (~933) based on manual confirmation that bib 2675 (official position 933) appears near the end of the video
 
 ### Additional Test: REC-0004-A (Half Marathon, angled view, 4-digit bibs)
@@ -1490,3 +1621,9 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | E024 | 2026-02-19 | 1.4 | Direct containment + uniqueness filter Run 13c | 23.0% recall, 95.9% precision | +7 TP vs Run 12; skip bibs overlapping >3 person tracks |
 | E025 | 2026-02-19 | 1.4 | REC-0004-A half marathon (angled, 4-digit bibs) | 22.5% visible bib recall, 55.0% precision | GT trimmed to visible finishers (1,400). OCR sees ~49% of GT; large bib range inflates FP; association still bottleneck |
 | E026 | 2026-02-19 | 1.4 | REC-0004-A frame extraction for detector data | Frames extracted for labeling | Use `scripts/extract_video_frames.py` → `data/unlabeled_rec0004a/` (uniform + top-k dense frames) |
+| E027 | 2026-02-23 | 1.4 | Bib detector v3 benchmark Run 14 | 24.2% recall, 95.8% precision (vs 2622 GT) | +32 TP vs Run 13c; detector no longer primary bottleneck; OCR/association now limit recall |
+| E028 | 2026-02-24 | 1.4 | ByteTrack person tracker Run 15 | 22.5% recall, 96.1% precision | IoU matching worse than centroid distance for tall/thin runner bboxes; -45 TP vs Run 14 |
+| E029 | 2026-02-24 | 1.4 | CentroidTracker max_disappeared=50 Run 16 | 21.7% recall, 95.5% precision | Fragmentation down 27% (2279→1665 tracks) but stale tracks reclaim wrong runners; -66 TP |
+| E030 | 2026-02-24 | 1.4 | Pipeline funnel diagnostics | 21.6% of HM votes are phantom reads | "85" on 298 tracks (bib design element); 157 well-read GT bibs lost in association |
+| E031 | 2026-02-24 | 1.4 | Track-frequency filter + short-bib penalty Run 17 | 25.7% recall, 96.6% precision (vs 2622 GT) | +39 TP, -4 FP vs Run 14; suppress bibs on >5 tracks; scale penalty by digit gap |
+| E032 | 2026-02-24 | 1.4 | Post-proc UNKNOWN resolution + cold-start fix Run 18-19 | 25.9% recall, 96.4% precision | +6 post-proc resolutions; cold-start phantom check; 84 UNKNOWNs have available bibs but spatial margin limits matching |
