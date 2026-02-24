@@ -353,6 +353,9 @@ def process_frames(
     bib_track_first_pos: Dict[int, Tuple[float, float]] = {}
     bib_track_first_frame: Dict[int, int] = {}
     bib_overlapped_persons: Dict[int, set] = {}
+    # Per-bib observations for post-processing (sampled every N frames to limit memory)
+    bib_observations: Dict[str, List[Tuple[int, Tuple[float, float]]]] = {}
+    _bib_obs_interval = 10  # sample every 10th frame per bib track
 
     timing_line = None
     crossing_detector = None
@@ -576,6 +579,14 @@ def process_frames(
             final_consensus_frame[track_id] = frame_idx
             bib_consensus_tracks.setdefault(consensus_number, set()).add(track_id)
             all_consensus[track_id] = final_consensus[track_id]
+
+            # Sample bib observations for post-processing
+            if classified.level.value in ("high", "medium"):
+                obs_list = bib_observations.setdefault(consensus_number, [])
+                if not obs_list or frame_idx - obs_list[-1][0] >= _bib_obs_interval:
+                    centroid_for_obs = tracked[track_id][0] if track_id in tracked else None
+                    if centroid_for_obs is not None:
+                        obs_list.append((frame_idx, centroid_for_obs))
 
             if classified.needs_review:
                 confidence_mgr.add_to_review_queue(
@@ -1010,27 +1021,18 @@ def process_frames(
     # ------------------------------------------------------------------
     postproc_resolved = 0
     if enable_crossings and crossing_log is not None and all_crossing_events:
-        # Build candidate pool: all high/medium bibs NOT already emitted,
-        # with their frame ranges and positions from bib tracks.
+        # Build candidate pool from sampled bib observations.
         candidate_bibs: Dict[str, List[Tuple[int, Tuple[float, float]]]] = {}
-        for bid, (bc_number, bc_conf, bc_level) in all_consensus.items():
-            if bc_level not in ("high", "medium"):
+        for bib_number, obs_list in bib_observations.items():
+            if bib_number in emitted_bibs:
                 continue
-            if bc_number in emitted_bibs:
+            if len(bib_consensus_tracks.get(bib_number, set())) > max_bib_tracks:
                 continue
-            if len(bib_consensus_tracks.get(bc_number, set())) > max_bib_tracks:
-                continue
-            bfp = bib_track_first_pos.get(bid)
-            blp = bib_track_last_pos.get(bid)
-            bff = bib_track_first_frame.get(bid)
-            blf = bib_track_last_frame.get(bid)
-            if bfp and bff is not None:
-                candidate_bibs.setdefault(bc_number, []).append((bff, bfp))
-            if blp and blf is not None and (blf, blp) != (bff, bfp):
-                candidate_bibs.setdefault(bc_number, []).append((blf, blp))
+            if obs_list:
+                candidate_bibs[bib_number] = obs_list
 
         unknown_events = [e for e in all_crossing_events if e.bib_number == "UNKNOWN"]
-        temporal_margin = 10.0 * fps  # 10 seconds
+        temporal_margin = 15.0 * fps  # 15 seconds
         spatial_margin = 600  # pixels
 
         for event in unknown_events:
