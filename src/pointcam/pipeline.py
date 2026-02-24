@@ -376,6 +376,8 @@ def process_frames(
     zone_min_frames = 5
     person_track_ready: set = set()
     prev_person_tracked_ids: set = set()
+    all_crossing_events: List[CrossingEvent] = []  # for post-processing pass
+    emitted_bibs: set = set()  # bibs already assigned to crossings
 
     enable_crossings = (
         config.timing_line_coords is not None or config.crossing_mode == "zone"
@@ -741,6 +743,15 @@ def process_frames(
                 bib_number = person_bib_assoc.get_bib(pid) or "UNKNOWN"
                 confidence = person_bib_assoc.get_bib_confidence(pid)
 
+                # Cold-start phantom check: suppress bibs that accumulated
+                # early votes before exceeding the track-frequency threshold
+                if (
+                    bib_number != "UNKNOWN"
+                    and len(bib_consensus_tracks.get(bib_number, set())) > max_bib_tracks
+                ):
+                    bib_number = "UNKNOWN"
+                    confidence = 0.0
+
                 if bib_number == "UNKNOWN":
                     px1, py1, px2, py2 = p_bbox
                     margin = max(50, int(0.15 * (px2 - px1)))
@@ -893,11 +904,13 @@ def process_frames(
                     source="pose",
                 )
                 crossing_log.write(event)
+                all_crossing_events.append(event)
                 total_crossings += 1
                 if bib_number == "UNKNOWN":
                     unknown_crossings += 1
                 else:
                     crossing_bib_found += 1
+                    emitted_bibs.add(bib_number)
                 if pid in person_track_diag and bib_number != "UNKNOWN":
                     person_track_diag[pid]["bib"] = bib_number
 
@@ -953,9 +966,12 @@ def process_frames(
                         source="bib_tracker",
                     )
                     crossing_log.write(event)
+                    all_crossing_events.append(event)
                     total_crossings += 1
                     if bib_number == "UNKNOWN":
                         unknown_crossings += 1
+                    else:
+                        emitted_bibs.add(bib_number)
 
             crossing_detector.cleanup(set(tracked.keys()))
 
@@ -988,6 +1004,80 @@ def process_frames(
                 f"  Frame {frame_idx}/{total_frames} "
                 f"({100*frame_idx/total_frames:.1f}%)"
             )
+
+    # ------------------------------------------------------------------
+    # Post-processing pass: resolve UNKNOWN crossings using global data
+    # ------------------------------------------------------------------
+    postproc_resolved = 0
+    if enable_crossings and crossing_log is not None and all_crossing_events:
+        # Build candidate pool: all high/medium bibs NOT already emitted,
+        # with their frame ranges and positions from bib tracks.
+        candidate_bibs: Dict[str, List[Tuple[int, Tuple[float, float]]]] = {}
+        for bid, (bc_number, bc_conf, bc_level) in all_consensus.items():
+            if bc_level not in ("high", "medium"):
+                continue
+            if bc_number in emitted_bibs:
+                continue
+            if len(bib_consensus_tracks.get(bc_number, set())) > max_bib_tracks:
+                continue
+            bfp = bib_track_first_pos.get(bid)
+            blp = bib_track_last_pos.get(bid)
+            bff = bib_track_first_frame.get(bid)
+            blf = bib_track_last_frame.get(bid)
+            if bfp and bff is not None:
+                candidate_bibs.setdefault(bc_number, []).append((bff, bfp))
+            if blp and blf is not None and (blf, blp) != (bff, bfp):
+                candidate_bibs.setdefault(bc_number, []).append((blf, blp))
+
+        unknown_events = [e for e in all_crossing_events if e.bib_number == "UNKNOWN"]
+        temporal_margin = 10.0 * fps  # 10 seconds
+        spatial_margin = 600  # pixels
+
+        for event in unknown_events:
+            best_bib = None
+            best_score = float("inf")
+
+            for bib_number, observations in candidate_bibs.items():
+                if bib_number in emitted_bibs:
+                    continue
+                for obs_frame, obs_pos in observations:
+                    dt = abs(event.frame_idx - obs_frame)
+                    if dt > temporal_margin:
+                        continue
+                    if event.chest_point is not None:
+                        dx = event.chest_point[0] - obs_pos[0]
+                        dy = event.chest_point[1] - obs_pos[1]
+                        dist = (dx * dx + dy * dy) ** 0.5
+                    else:
+                        px1, py1, px2, py2 = event.person_bbox
+                        pcx = (px1 + px2) / 2.0
+                        pcy = (py1 + py2) / 2.0
+                        dx = pcx - obs_pos[0]
+                        dy = pcy - obs_pos[1]
+                        dist = (dx * dx + dy * dy) ** 0.5
+                    if dist > spatial_margin:
+                        continue
+                    # Score: prefer closer in time and space
+                    score = dt + dist
+                    if score < best_score:
+                        best_score = score
+                        best_bib = bib_number
+
+            if best_bib is not None:
+                # Validate if bib_validator available
+                if bib_validator is not None and best_bib not in bib_validator.bib_set:
+                    continue
+                bc_conf = max(
+                    (c for bid, (n, c, l) in all_consensus.items() if n == best_bib),
+                    default=0.0,
+                )
+                event.bib_number = best_bib
+                event.confidence = bc_conf
+                event.source = "postproc"
+                crossing_log.write(event)
+                emitted_bibs.add(best_bib)
+                postproc_resolved += 1
+                unknown_crossings -= 1
 
     if out_writer:
         out_writer.release()
@@ -1090,6 +1180,7 @@ def process_frames(
             print(f"  Total crossings: {total_crossings}")
             print(f"  With bib: {total_crossings - unknown_crossings}")
             print(f"  UNKNOWN (no bib): {unknown_crossings}")
+            print(f"  Post-proc resolved: {postproc_resolved}")
             print(f"  Dedup suppressed: {dedup_suppressed}")
             if person_tracker is not None:
                 print(f"  Person tracks: {person_tracker.next_id}")
