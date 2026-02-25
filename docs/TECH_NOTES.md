@@ -22,7 +22,7 @@ Entries are organized by phase and date. Each entry should include:
 
 ---
 
-## 2026-02-24: Pipeline Funnel Diagnostics & Association Fixes (Runs 14-19)
+## 2026-02-24: Pipeline Funnel Diagnostics & Association Fixes (Runs 14-20)
 
 ### Pipeline Funnel Analysis
 
@@ -66,22 +66,30 @@ crossings to unmatched bibs using temporal+spatial proximity of all sampled bib 
 
 ### Run Comparison
 
-| Metric | Run 14 | Run 17 | Run 19 |
-|---|---|---|---|
-| True positives | 634 | 673 | 679 |
-| False positives | 28 | 24 | 25 |
-| Precision | 95.8% | 96.6% | 96.4% |
-| Visible recall | 68.0% | 72.1% | 72.8% |
-| Person tracks | 2,279 | 2,279 | 2,279 |
-| UNKNOWN crossings | 68 | 96 | 110 |
-| Post-proc resolved | - | - | 6 |
+| Metric | Run 14 | Run 17 | Run 19 | Run 20 |
+|---|---|---|---|---|
+| True positives | 634 | 673 | 679 | **691** |
+| False positives | 28 | 24 | 25 | 26 |
+| Precision | 95.8% | 96.6% | 96.4% | 96.4% |
+| Visible recall | 68.0% | 72.1% | 72.8% | **74.1%** |
+| Person tracks | 2,279 | 2,279 | 2,279 | 2,279 |
+| UNKNOWN crossings | 68 | 96 | 110 | 116 |
+| Post-proc resolved | - | - | 6 | **19** |
 
-### Remaining Opportunity (from Run 17 diagnostics)
+### Run 20: Post-proc spatial margin 600→1000px
 
-- **125 strong lost bibs**: 10+ HM reads, good OCR signal, association failed
-- **332 moderate lost bibs**: 1-9 HM reads, mostly single-track (brief glimpses)
-- **84 UNKNOWN crossings** with an available GT bib nearby temporally
-- Spatial matching is the primary limiter for post-proc (bib position when readable vs person position when crossing)
+**Change**: Widened `spatial_margin` from 600 to 1000 pixels in the post-processing UNKNOWN resolution pass.
+
+**Why it helped**: Bibs are readable when runners approach the camera (upstream of the finish line), but the crossing event fires when they've moved past the timing zone — often 400-800px away from where the bib was last read. At 600px, many valid bib-to-crossing matches were outside the search radius. At 1000px, 13 additional UNKNOWNs were resolved (19 total, up from 6), netting +12 TP with only +1 FP. Precision held steady at 96.4%.
+
+**Takeaway**: The spatial gap between "where a bib is readable" and "where a crossing fires" is the fundamental challenge for post-proc matching. The wider margin captures more true matches without introducing significant noise because the temporal constraint (15s window) is already selective enough.
+
+### Remaining Opportunity
+
+- **~125 strong lost bibs**: 10+ HM reads, good OCR signal, association failed during main loop
+- **~332 moderate lost bibs**: 1-9 HM reads, mostly single-track (brief glimpses)
+- **97 UNKNOWN crossings** still unresolved after post-proc (some may have no bib signal at all)
+- Further gains likely require improving the main-loop association, not just post-proc recovery
 
 ### Key Lessons
 
@@ -89,6 +97,7 @@ crossings to unmatched bibs using temporal+spatial proximity of all sampled bib 
 - **Increasing max_disappeared without reducing max_distance** causes stale tracks to reclaim unrelated runners, hurting recall.
 - **Phantom reads from bib design elements** are a major source of vote contamination. Auto-detecting these via track frequency is effective.
 - **The association gap is fundamentally spatial**: bibs are readable when runners approach the camera but crossings fire when they've moved past. Post-processing with wider margins helps but can't fully bridge this gap.
+- **Post-proc spatial margin is a high-leverage knob**: 600→1000px tripled resolved UNKNOWNs with no precision cost, because the temporal window provides sufficient selectivity.
 
 ---
 
