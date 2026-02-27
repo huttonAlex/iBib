@@ -23,6 +23,7 @@ import argparse
 import signal
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -38,7 +39,7 @@ from pointcam.inference import (
     PARSeqOCR,
     TensorRTCrnnOCR,
 )
-from pointcam.pipeline import PipelineConfig, UltralyticsBibDetector, process_frames
+from pointcam.pipeline import PipelineConfig, ProgressInfo, UltralyticsBibDetector, process_frames
 from pointcam.recognition import BibSetValidator
 
 
@@ -183,6 +184,9 @@ def main():
         help="Manual clock offset in seconds for displayed timestamps",
     )
     parser.add_argument("--show", action="store_true", help="Live video preview")
+    parser.add_argument(
+        "--tui", action="store_true", help="Rich terminal dashboard (requires pip install pointcam[tui])"
+    )
 
     args = parser.parse_args()
 
@@ -205,7 +209,8 @@ def main():
 
     # -- Ctrl+C handling: stop camera gracefully -----------------------------
     def _signal_handler(sig, frame):
-        print("\n  Ctrl+C received — stopping camera...")
+        if not args.tui:
+            print("\n  Ctrl+C received — stopping camera...")
         camera.stop()
 
     signal.signal(signal.SIGINT, _signal_handler)
@@ -223,15 +228,16 @@ def main():
     # -- Load models ---------------------------------------------------------
     device = _resolve_device()
 
-    print("=" * 70)
-    print("PointCam Live Pipeline")
-    print("=" * 70)
-    print(f"Source:    {camera.name}")
-    print(f"Detector: {detector_path}")
-    print(f"OCR:      {args.ocr} (backend: {args.ocr_backend})")
-    print(f"Placement: {args.placement}")
-    print(f"Crossing:  {args.crossing_mode}")
-    print(f"Output:   {output_dir}")
+    if not args.tui:
+        print("=" * 70)
+        print("PointCam Live Pipeline")
+        print("=" * 70)
+        print(f"Source:    {camera.name}")
+        print(f"Detector: {detector_path}")
+        print(f"OCR:      {args.ocr} (backend: {args.ocr_backend})")
+        print(f"Placement: {args.placement}")
+        print(f"Crossing:  {args.crossing_mode}")
+        print(f"Output:   {output_dir}")
 
     # Bib validator
     bib_validator = None
@@ -323,11 +329,27 @@ def main():
         crossing_mode=args.crossing_mode,
     )
 
+    # -- TUI dashboard (optional) ---------------------------------------------
+    dashboard = None
+    if args.tui:
+        try:
+            from pointcam.dashboard import LiveDashboard
+        except ImportError:
+            print("ERROR: --tui requires the 'rich' package.")
+            print("  Install with: pip install pointcam[tui]")
+            sys.exit(1)
+        dashboard = LiveDashboard(
+            camera_name=camera.name,
+            ocr_model=f"{args.ocr} ({args.ocr_backend})",
+            crossing_mode=args.crossing_mode,
+            placement=args.placement,
+        )
+
     # -- Crossing callback (print to terminal) -------------------------------
     time_offset = timedelta(seconds=args.time_offset)
     crossing_count = [0]  # mutable for closure
 
-    def on_crossing(event: CrossingEvent):
+    def on_crossing_plain(event: CrossingEvent):
         crossing_count[0] += 1
         wall_time = datetime.now() + time_offset
         ts = wall_time.strftime("%H:%M:%S")
@@ -336,16 +358,26 @@ def main():
         src = event.source
         print(f"  >> CROSSING #{crossing_count[0]:>4d}  bib={bib:<6s}  conf={conf:.2f}  [{src}]  {ts}")
 
+    def on_crossing_tui(event: CrossingEvent):
+        crossing_count[0] += 1
+        dashboard.on_crossing(event)
+
+    crossing_cb = on_crossing_tui if dashboard else on_crossing_plain
+    progress_cb = dashboard.on_progress if dashboard else None
+
     # -- Run pipeline --------------------------------------------------------
-    print()
-    print("=" * 70)
-    print(f"LIVE — press Ctrl+C to stop")
-    print("=" * 70)
-    print()
+    if not dashboard:
+        print()
+        print("=" * 70)
+        print("LIVE — press Ctrl+C to stop")
+        print("=" * 70)
+        print()
 
     t_start = time.time()
 
-    with camera:
+    tui_ctx = dashboard if dashboard else nullcontext()
+
+    with camera, tui_ctx:
         # For file sources, pass total_frames so progress % works
         total = camera.total_frames if args.source == "file" else None
         fps = camera.fps
@@ -363,7 +395,8 @@ def main():
             show=args.show,
             total_frames=total,
             frame_size=(camera.width, camera.height),
-            on_crossing=on_crossing,
+            on_crossing=crossing_cb,
+            on_progress=progress_cb,
         )
 
     elapsed = time.time() - t_start

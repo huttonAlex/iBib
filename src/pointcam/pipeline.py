@@ -133,6 +133,18 @@ class PipelineResult:
     outputs: PipelineOutputs
 
 
+@dataclass
+class ProgressInfo:
+    """Snapshot of pipeline progress, emitted periodically during processing."""
+
+    frame_idx: int
+    elapsed_sec: float
+    total_crossings: int
+    unknown_crossings: int
+    total_detections: int
+    fps: float
+
+
 def _resolve_device(preferred: Optional[str] = None) -> str:
     if preferred:
         return preferred
@@ -237,6 +249,7 @@ def process_frames(
     start_frame_idx: int = 0,
     print_summary: bool = True,
     on_crossing: Optional[Callable[[CrossingEvent], None]] = None,
+    on_progress: Optional[Callable[[ProgressInfo], None]] = None,
 ) -> PipelineResult:
     """Process an iterable of frames with the full pipeline."""
 
@@ -1070,17 +1083,32 @@ def process_frames(
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-        if total_frames and frame_idx % 100 == 0:
-            print(
-                f"  Frame {frame_idx}/{total_frames} "
-                f"({100*frame_idx/total_frames:.1f}%)"
-            )
-        elif not total_frames and frame_idx % 300 == 0 and frame_idx > 0:
+        # Periodic progress reporting
+        progress_interval = 100 if total_frames else 300
+        if frame_idx > 0 and frame_idx % progress_interval == 0:
             elapsed = time.time() - wall_start
-            print(
-                f"  Frame {frame_idx} | {elapsed:.0f}s elapsed | "
-                f"{total_crossings} crossings"
-            )
+            current_fps = frame_idx / elapsed if elapsed > 0 else 0.0
+            if on_progress is not None:
+                on_progress(
+                    ProgressInfo(
+                        frame_idx=frame_idx,
+                        elapsed_sec=elapsed,
+                        total_crossings=total_crossings,
+                        unknown_crossings=unknown_crossings,
+                        total_detections=total_detections,
+                        fps=current_fps,
+                    )
+                )
+            elif total_frames:
+                print(
+                    f"  Frame {frame_idx}/{total_frames} "
+                    f"({100*frame_idx/total_frames:.1f}%)"
+                )
+            else:
+                print(
+                    f"  Frame {frame_idx} | {elapsed:.0f}s elapsed | "
+                    f"{total_crossings} crossings"
+                )
 
     # ------------------------------------------------------------------
     # Post-processing pass: resolve UNKNOWN crossings using global data

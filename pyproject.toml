@@ -45,6 +45,9 @@ dev = [
 gpu = [
     "paddlepaddle-gpu>=2.5.0",
 ]
+tui = [
+    "rich>=13.0.0",
+]
 ocr-eval = [
     "transformers>=4.30.0",
     "torch>=2.0.0",
