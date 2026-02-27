@@ -10,7 +10,7 @@ import csv
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import itertools
 import cv2
@@ -236,6 +236,7 @@ def process_frames(
     frame_size: Optional[Tuple[int, int]] = None,
     start_frame_idx: int = 0,
     print_summary: bool = True,
+    on_crossing: Optional[Callable[[CrossingEvent], None]] = None,
 ) -> PipelineResult:
     """Process an iterable of frames with the full pipeline."""
 
@@ -420,6 +421,8 @@ def process_frames(
 
         crossing_log_path = output_dir / f"{output_stem}_crossings.csv"
         crossing_log = CrossingEventLog(crossing_log_path)
+
+    wall_start = time.time()
 
     for frame in frame_iter:
         time_sec = frame_idx / fps
@@ -968,6 +971,8 @@ def process_frames(
                     source="pose",
                 )
                 crossing_log.write(event)
+                if on_crossing is not None:
+                    on_crossing(event)
                 all_crossing_events.append(event)
                 total_crossings += 1
                 if bib_number == "UNKNOWN":
@@ -1030,6 +1035,8 @@ def process_frames(
                         source="bib_tracker",
                     )
                     crossing_log.write(event)
+                    if on_crossing is not None:
+                        on_crossing(event)
                     all_crossing_events.append(event)
                     total_crossings += 1
                     if bib_number == "UNKNOWN":
@@ -1067,6 +1074,12 @@ def process_frames(
             print(
                 f"  Frame {frame_idx}/{total_frames} "
                 f"({100*frame_idx/total_frames:.1f}%)"
+            )
+        elif not total_frames and frame_idx % 300 == 0 and frame_idx > 0:
+            elapsed = time.time() - wall_start
+            print(
+                f"  Frame {frame_idx} | {elapsed:.0f}s elapsed | "
+                f"{total_crossings} crossings"
             )
 
     # ------------------------------------------------------------------
@@ -1130,6 +1143,8 @@ def process_frames(
                 event.confidence = bc_conf
                 event.source = "postproc"
                 crossing_log.write(event)
+                if on_crossing is not None:
+                    on_crossing(event)
                 emitted_bibs.add(best_bib)
                 postproc_resolved += 1
                 unknown_crossings -= 1

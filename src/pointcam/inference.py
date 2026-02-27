@@ -381,6 +381,168 @@ class OnnxTensorRTParseqOCR:
 
 
 # ---------------------------------------------------------------------------
+# PARSeq — PyTorch (torch.hub)
+# ---------------------------------------------------------------------------
+
+
+class PARSeqOCR:
+    """PARSeq OCR from fine-tuned PyTorch checkpoint.
+
+    Uses ``torch.hub`` to load the PARSeq architecture and applies a
+    fine-tuned state dict.  Heavier than the ONNX variants but required
+    when ONNX Runtime cannot handle certain ops (e.g. on Jetson).
+
+    Args:
+        checkpoint_path: Path to ``.pt`` checkpoint (state dict or full).
+        device: ``"cpu"`` or ``"cuda"``.
+    """
+
+    def __init__(self, checkpoint_path: str, device: str = "cpu"):
+        import torch
+
+        self._torch = torch
+        self.device = device
+        self.model = torch.hub.load(
+            "baudm/parseq", "parseq", pretrained=True, trust_repo=True
+        )
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if "model_state_dict" in state:
+            self.model.load_state_dict(state["model_state_dict"])
+        else:
+            self.model.load_state_dict(state)
+        self.model.eval().to(device)
+
+    def predict(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
+        import torch
+
+        torch = self._torch
+        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (128, 32), interpolation=cv2.INTER_CUBIC)
+        t = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
+        tensor = torch.from_numpy((t - 0.5) / 0.5).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(tensor)
+            probs = logits.softmax(-1)
+            preds, probs_out = self.model.tokenizer.decode(probs)
+
+        text = preds[0]
+        p = probs_out[0]
+        if p.numel() == 0:
+            confidence = 0.5
+        elif p.dim() == 1:
+            confidence = p.cumprod(-1)[-1].item()
+        else:
+            confidence = p.cumprod(-1)[:, -1].item()
+
+        digits = "".join(c for c in text if c.isdigit())
+        return digits, confidence
+
+    def predict_batch(self, crops_bgr: List[np.ndarray]) -> List[Tuple[str, float]]:
+        torch = self._torch
+        if not crops_bgr:
+            return []
+
+        preprocessed = []
+        for crop in crops_bgr:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(rgb, (128, 32), interpolation=cv2.INTER_CUBIC)
+            t = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
+            preprocessed.append((t - 0.5) / 0.5)
+
+        batch = torch.from_numpy(np.stack(preprocessed)).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(batch)
+            probs = logits.softmax(-1)
+            preds, probs_out = self.model.tokenizer.decode(probs)
+
+        results = []
+        for i in range(len(crops_bgr)):
+            text = preds[i]
+            p = probs_out[i]
+            if p.numel() == 0:
+                confidence = 0.5
+            elif p.dim() == 1:
+                confidence = p.cumprod(-1)[-1].item()
+            else:
+                confidence = p.cumprod(-1)[:, -1].item()
+            digits = "".join(c for c in text if c.isdigit())
+            results.append((digits, confidence))
+        return results
+
+    def predict_batch_detailed(self, crops_bgr: List[np.ndarray]) -> List[DetailedOCRResult]:
+        torch = self._torch
+        if not crops_bgr:
+            return []
+
+        preprocessed = []
+        for crop in crops_bgr:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(rgb, (128, 32), interpolation=cv2.INTER_CUBIC)
+            t = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
+            preprocessed.append((t - 0.5) / 0.5)
+
+        batch = torch.from_numpy(np.stack(preprocessed)).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(batch)
+            probs = logits.softmax(-1)
+            preds, probs_out = self.model.tokenizer.decode(probs)
+
+        # Build digit-index mapping from model's tokenizer vocab
+        itos = self.model.tokenizer._itos
+        digit_indices = [i for i, ch in enumerate(itos) if ch.isdigit()]
+
+        probs_np = probs.cpu().numpy()
+
+        results = []
+        for i in range(len(crops_bgr)):
+            text = preds[i]
+            p = probs_out[i]
+            if p.numel() == 0:
+                confidence = 0.5
+            elif p.dim() == 1:
+                confidence = p.cumprod(-1)[-1].item()
+            else:
+                confidence = p.cumprod(-1)[:, -1].item()
+
+            digits_text = ""
+            digit_details = []
+            pos = 1  # skip BOS at position 0
+            for ch in text:
+                if pos >= probs_np.shape[1]:
+                    break
+                if ch.isdigit():
+                    digits_text += ch
+                    top_idx = int(probs_np[i, pos].argmax())
+                    top_prob = float(probs_np[i, pos, top_idx])
+                    best_ru_idx, best_ru_prob = top_idx, 0.0
+                    for di in digit_indices:
+                        if di != top_idx and probs_np[i, pos, di] > best_ru_prob:
+                            best_ru_idx = di
+                            best_ru_prob = float(probs_np[i, pos, di])
+                    digit_details.append(
+                        DigitDetail(
+                            digit=ch,
+                            prob=top_prob,
+                            runner_up_digit=itos[best_ru_idx] if best_ru_idx != top_idx else ch,
+                            runner_up_prob=best_ru_prob,
+                        )
+                    )
+                pos += 1
+
+            results.append(
+                DetailedOCRResult(
+                    text=digits_text,
+                    confidence=confidence,
+                    per_digit=digit_details,
+                )
+            )
+        return results
+
+
+# ---------------------------------------------------------------------------
 # CRNN — ONNX Runtime (CUDA/CPU)
 # ---------------------------------------------------------------------------
 
