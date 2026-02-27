@@ -66,15 +66,15 @@ crossings to unmatched bibs using temporal+spatial proximity of all sampled bib 
 
 ### Run Comparison
 
-| Metric | Run 14 | Run 17 | Run 19 | Run 20 |
+| Metric | Run 14 | Run 17 | Run 20 | Run 22 |
 |---|---|---|---|---|
-| True positives | 634 | 673 | 679 | **691** |
-| False positives | 28 | 24 | 25 | 26 |
-| Precision | 95.8% | 96.6% | 96.4% | 96.4% |
-| Visible recall | 68.0% | 72.1% | 72.8% | **74.1%** |
+| True positives | 634 | 673 | 691 | **719** |
+| False positives | 28 | 24 | 26 | **0** |
+| Precision | 95.8% | 96.6% | 96.4% | **100.0%** |
+| Visible recall | 68.0% | 72.1% | 74.1% | **77.1%** |
 | Person tracks | 2,279 | 2,279 | 2,279 | 2,279 |
-| UNKNOWN crossings | 68 | 96 | 110 | 116 |
-| Post-proc resolved | - | - | 6 | **19** |
+| UNKNOWN crossings | 68 | 96 | 116 | 108 |
+| Post-proc resolved | - | - | 19 | 15 |
 
 ### Run 20: Post-proc spatial margin 600→1000px
 
@@ -84,11 +84,24 @@ crossings to unmatched bibs using temporal+spatial proximity of all sampled bib 
 
 **Takeaway**: The spatial gap between "where a bib is readable" and "where a crossing fires" is the fundamental challenge for post-proc matching. The wider margin captures more true matches without introducing significant noise because the temporal constraint (15s window) is already selective enough.
 
+### Run 22: Actual Participant Bib List (new best)
+
+**Change**: Replaced `--bib-range 2-3000` (2,999 numbers) with `--bib-set gt_bibs.txt` (2,622 actual participant bibs). Also added per-digit OCR confidence infrastructure and repeated-digit phantom filter.
+
+**Results**: 719 TP (+28), **0 FP** (-26), 100.0% precision, 77.1% recall.
+
+**Why it helped**: With a range, every 3-4 digit number is "valid" — phantom reads like "111", "1111", and misread bibs all pass validation. With the actual bib list, only real participant numbers get the "known bib" confidence boost, and non-participant numbers are naturally filtered. All 26 previous FPs were eliminated with zero new FPs introduced.
+
+**Run 21 failures (tested and reverted)**:
+- **Wider association window (350→500px)**: Lost 89 TPs. 79 were replaced by a different runner's bib — the wider radius caused cross-runner contamination in dense groups. Reverted to 350px.
+- **Per-digit OCR correction with bib range**: All 435 corrections were single-digit reads ("1"→"5") — partial OCR fragments, not real digit confusions. These bypassed the short-bib penalty by becoming "valid" bibs. Restricted to 3+ digit bibs only.
+- **Per-digit correction with actual bib list (Run 22)**: 0 corrections fired — PARSeq assigns >0.6 confidence even to wrong digits. The threshold (0.6) or approach needs rethinking.
+
 ### Remaining Opportunity
 
-- **~125 strong lost bibs**: 10+ HM reads, good OCR signal, association failed during main loop
-- **~332 moderate lost bibs**: 1-9 HM reads, mostly single-track (brief glimpses)
-- **97 UNKNOWN crossings** still unresolved after post-proc (some may have no bib signal at all)
+- **~214 visible GT bibs still missing** (933 - 719)
+- **108 UNKNOWN crossings** remain after post-proc (15 resolved)
+- **Per-digit correction infrastructure** is built (`DetailedOCRResult`, `predict_batch_detailed()`) but needs either lower confidence threshold or alternative approach (e.g., per-digit voting weight)
 - Further gains likely require improving the main-loop association, not just post-proc recovery
 
 ### Key Lessons
@@ -1636,3 +1649,6 @@ Standard metrics for comparing pipeline runs. Every benchmark run should report 
 | E030 | 2026-02-24 | 1.4 | Pipeline funnel diagnostics | 21.6% of HM votes are phantom reads | "85" on 298 tracks (bib design element); 157 well-read GT bibs lost in association |
 | E031 | 2026-02-24 | 1.4 | Track-frequency filter + short-bib penalty Run 17 | 25.7% recall, 96.6% precision (vs 2622 GT) | +39 TP, -4 FP vs Run 14; suppress bibs on >5 tracks; scale penalty by digit gap |
 | E032 | 2026-02-24 | 1.4 | Post-proc UNKNOWN resolution + cold-start fix Run 18-19 | 25.9% recall, 96.4% precision | +6 post-proc resolutions; cold-start phantom check; 84 UNKNOWNs have available bibs but spatial margin limits matching |
+| E033 | 2026-02-25 | 1.4 | Post-proc wider margin Run 20 | 26.4% recall, 96.4% precision | +12 TP from spatial margin 600→1000px; 19 post-proc resolutions total |
+| E034 | 2026-02-26 | 1.4 | Per-digit OCR + wider assoc + phantom filter Run 21 | 25.3% recall, 96.7% precision | Wider assoc (500px) lost 89 TPs from cross-runner contamination; digit correction all single-digit (harmful); reverted |
+| E035 | 2026-02-26 | 1.4 | Actual bib list + phantom filter Run 22 (new best) | **27.4% recall, 100.0% precision** | +28 TP, -26 FP vs Run 20; `--bib-set` eliminates all FPs; "111"/"1111" gone; per-digit correction fires 0 times (PARSeq too confident) |

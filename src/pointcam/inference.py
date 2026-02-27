@@ -18,11 +18,31 @@ Usage:
     results = ocr.predict_batch([crop1, crop2, crop3])
 """
 
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import json
 import cv2
 import numpy as np
+
+
+@dataclass
+class DigitDetail:
+    """Per-digit OCR confidence detail."""
+
+    digit: str
+    prob: float
+    runner_up_digit: str
+    runner_up_prob: float
+
+
+@dataclass
+class DetailedOCRResult:
+    """OCR result with per-digit confidence breakdown."""
+
+    text: str
+    confidence: float
+    per_digit: List[DigitDetail] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +113,53 @@ class ParseqTokenizer:
             results.append((text, confidence))
         return results
 
+    def decode_detailed(self, probs: np.ndarray) -> List[DetailedOCRResult]:
+        """Decode probability tensor to DetailedOCRResult with per-digit info."""
+        if probs.ndim != 3:
+            raise ValueError(f"Expected (B, T, V) probs, got shape {probs.shape}")
+        vocab_size = probs.shape[-1]
+        if vocab_size != len(self.vocab):
+            raise ValueError(
+                f"Tokenizer vocab size {len(self.vocab)} != model vocab {vocab_size}"
+            )
+
+        # Build set of vocab indices that are digits
+        digit_indices = [i for i, ch in enumerate(self.vocab) if ch.isdigit()]
+
+        results: List[DetailedOCRResult] = []
+        for sample in probs:
+            indices = sample.argmax(axis=-1)
+            token_probs = sample[np.arange(sample.shape[0]), indices]
+            chars: List[str] = []
+            confs: List[float] = []
+            digits: List[DigitDetail] = []
+            for t, (idx, prob) in enumerate(zip(indices, token_probs)):
+                if self.eos_id is not None and idx == self.eos_id:
+                    break
+                if self.bos_id is not None and idx == self.bos_id:
+                    continue
+                if self.pad_id is not None and idx == self.pad_id:
+                    continue
+                if idx < 0 or idx >= len(self.vocab):
+                    continue
+                ch = self.vocab[idx]
+                if ch.isdigit():
+                    chars.append(ch)
+                    confs.append(float(prob))
+                    # Find runner-up among digit tokens
+                    digit_probs = [(di, float(sample[t, di])) for di in digit_indices if di != idx]
+                    if digit_probs:
+                        ru_idx, ru_prob = max(digit_probs, key=lambda x: x[1])
+                        ru_digit = self.vocab[ru_idx]
+                    else:
+                        ru_digit = ch
+                        ru_prob = 0.0
+                    digits.append(DigitDetail(ch, float(prob), ru_digit, ru_prob))
+            text = "".join(chars)
+            confidence = float(np.prod(confs)) if confs else 0.5
+            results.append(DetailedOCRResult(text, confidence, digits))
+        return results
+
 
 # ---------------------------------------------------------------------------
 # PARSeq — ONNX Runtime (CUDA/CPU)
@@ -140,10 +207,20 @@ class OnnxParseqOCR:
         probs = exp / exp.sum(axis=-1, keepdims=True)
         return self._tokenizer.decode(probs)
 
+    def _decode_output_detailed(self, logits: np.ndarray) -> List[DetailedOCRResult]:
+        exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = exp / exp.sum(axis=-1, keepdims=True)
+        return self._tokenizer.decode_detailed(probs)
+
     def predict(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
         tensor = self._preprocess(crop_bgr)[np.newaxis]
         logits = self.session.run(None, {self.input_name: tensor})[0]
         return self._decode_output(logits)[0]
+
+    def predict_detailed(self, crop_bgr: np.ndarray) -> DetailedOCRResult:
+        tensor = self._preprocess(crop_bgr)[np.newaxis]
+        logits = self.session.run(None, {self.input_name: tensor})[0]
+        return self._decode_output_detailed(logits)[0]
 
     def predict_batch(self, crops_bgr: List[np.ndarray]) -> List[Tuple[str, float]]:
         if not crops_bgr:
@@ -151,6 +228,13 @@ class OnnxParseqOCR:
         batch = np.stack([self._preprocess(c) for c in crops_bgr])
         logits = self.session.run(None, {self.input_name: batch})[0]
         return self._decode_output(logits)
+
+    def predict_batch_detailed(self, crops_bgr: List[np.ndarray]) -> List[DetailedOCRResult]:
+        if not crops_bgr:
+            return []
+        batch = np.stack([self._preprocess(c) for c in crops_bgr])
+        logits = self.session.run(None, {self.input_name: batch})[0]
+        return self._decode_output_detailed(logits)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +333,11 @@ class OnnxTensorRTParseqOCR:
         probs = exp / exp.sum(axis=-1, keepdims=True)
         return self._tokenizer.decode(probs)
 
+    def _decode_output_detailed(self, logits: np.ndarray) -> List[DetailedOCRResult]:
+        exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = exp / exp.sum(axis=-1, keepdims=True)
+        return self._tokenizer.decode_detailed(probs)
+
     def predict(self, crop_bgr: np.ndarray) -> Tuple[str, float]:
         """Predict bib number from a single BGR crop.
 
@@ -261,6 +350,11 @@ class OnnxTensorRTParseqOCR:
         tensor = self._preprocess(crop_bgr)[np.newaxis]  # (1, 3, 32, 128)
         logits = self.session.run(None, {self.input_name: tensor})[0]
         return self._decode_output(logits)[0]
+
+    def predict_detailed(self, crop_bgr: np.ndarray) -> DetailedOCRResult:
+        tensor = self._preprocess(crop_bgr)[np.newaxis]
+        logits = self.session.run(None, {self.input_name: tensor})[0]
+        return self._decode_output_detailed(logits)[0]
 
     def predict_batch(self, crops_bgr: List[np.ndarray]) -> List[Tuple[str, float]]:
         """Predict bib numbers from a batch of BGR crops.
@@ -277,6 +371,13 @@ class OnnxTensorRTParseqOCR:
         batch = np.stack([self._preprocess(c) for c in crops_bgr])  # (N, 3, 32, 128)
         logits = self.session.run(None, {self.input_name: batch})[0]
         return self._decode_output(logits)
+
+    def predict_batch_detailed(self, crops_bgr: List[np.ndarray]) -> List[DetailedOCRResult]:
+        if not crops_bgr:
+            return []
+        batch = np.stack([self._preprocess(c) for c in crops_bgr])
+        logits = self.session.run(None, {self.input_name: batch})[0]
+        return self._decode_output_detailed(logits)
 
 
 # ---------------------------------------------------------------------------

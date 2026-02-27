@@ -337,6 +337,7 @@ def process_frames(
     partial_rejected = 0
     cleanup_modified = 0
     ocr_skip_count = 0
+    digit_corrections = 0
 
     final_consensus: Dict[int, Tuple[str, float, str]] = {}
     final_consensus_frame: Dict[int, int] = {}
@@ -506,7 +507,14 @@ def process_frames(
             ocr_batch_items.append((track_id, bbox, det_conf, crop))
 
         crops = [item[3] for item in ocr_batch_items]
-        if crops and hasattr(ocr_model, "predict_batch"):
+        ocr_detailed_results = None
+        if crops and hasattr(ocr_model, "predict_batch_detailed"):
+            t2 = time.perf_counter()
+            ocr_detailed_results = ocr_model.predict_batch_detailed(crops)
+            t3 = time.perf_counter()
+            total_ocr_time += t3 - t2
+            ocr_results = [(r.text, r.confidence) for r in ocr_detailed_results]
+        elif crops and hasattr(ocr_model, "predict_batch"):
             t2 = time.perf_counter()
             ocr_results = ocr_model.predict_batch(crops)
             t3 = time.perf_counter()
@@ -547,6 +555,35 @@ def process_frames(
                 validated_number = validation_result.validated
                 is_valid = validation_result.is_valid
 
+            # Digit-confusion correction: if bib not in known set, try swapping
+            # low-confidence digits with their runner-up to produce a valid bib.
+            # Only for 3+ digit bibs (single/double-digit reads are partial fragments).
+            if (
+                bib_validator is not None
+                and validated_number not in bib_validator.bib_set
+                and len(validated_number) >= 3
+                and ocr_detailed_results is not None
+            ):
+                detail = ocr_detailed_results[idx]
+                raw_text = detail.text
+                if (
+                    detail.per_digit
+                    and len(detail.per_digit) == len(raw_text)
+                    and len(raw_text) == len(validated_number)
+                ):
+                    for di, dd in enumerate(detail.per_digit):
+                        if dd.prob < 0.6 and dd.runner_up_prob > 0.1:
+                            candidate = (
+                                validated_number[:di]
+                                + dd.runner_up_digit
+                                + validated_number[di + 1 :]
+                            )
+                            if candidate in bib_validator.bib_set:
+                                validated_number = candidate
+                                is_valid = True
+                                digit_corrections += 1
+                                break
+
             _is_known_bib = (
                 bib_validator is not None and validated_number in bib_validator.bib_set
             )
@@ -554,6 +591,12 @@ def process_frames(
                 if len(validated_number) == 1 and ocr_conf < 0.95:
                     continue
                 if len(validated_number) == 2 and ocr_conf < 0.90:
+                    continue
+                # Repeated-digit phantom filter: reject "111", "1111", "2222", etc.
+                if (
+                    len(validated_number) >= 3
+                    and len(set(validated_number)) == 1
+                ):
                     continue
 
             voting.update(track_id, validated_number, ocr_conf, frame_idx)
@@ -759,6 +802,16 @@ def process_frames(
                 if (
                     bib_number != "UNKNOWN"
                     and len(bib_consensus_tracks.get(bib_number, set())) > max_bib_tracks
+                ):
+                    bib_number = "UNKNOWN"
+                    confidence = 0.0
+
+                # Repeated-digit phantom check at emission time:
+                # suppress "111", "1111", etc. even if in valid bib range
+                if (
+                    bib_number != "UNKNOWN"
+                    and len(bib_number) >= 3
+                    and len(set(bib_number)) == 1
                 ):
                     bib_number = "UNKNOWN"
                     confidence = 0.0
@@ -1156,6 +1209,7 @@ def process_frames(
         )
         print(f"  OCR stable-track skips: {ocr_skip_count}")
         print(f"  OCR cleanups applied: {cleanup_modified}")
+        print(f"  Digit-confusion corrections: {digit_corrections}")
 
         level_counts = {"high": 0, "medium": 0, "low": 0, "reject": 0}
         bib_counts: Dict[str, int] = {}
