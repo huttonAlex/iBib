@@ -184,6 +184,7 @@ def main():
         help="Manual clock offset in seconds for displayed timestamps",
     )
     parser.add_argument("--show", action="store_true", help="Live video preview")
+    parser.add_argument("--record", action="store_true", help="Record video to output directory")
     parser.add_argument(
         "--tui", action="store_true", help="Rich terminal dashboard (requires pip install pointcam[tui])"
     )
@@ -316,7 +317,7 @@ def main():
         conf_threshold=args.conf,
         ocr_conf_threshold=args.ocr_conf,
         enable_quality_filter=True,
-        write_video=False,
+        write_video=args.record,
         placement=args.placement,
         timing_line_coords=timing_line_coords,
         crossing_direction=args.crossing_direction,
