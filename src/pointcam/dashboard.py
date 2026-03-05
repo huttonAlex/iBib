@@ -46,6 +46,9 @@ class DashboardState:
     elapsed_sec: float = 0.0
     fps: float = 0.0
     total_detections: int = 0
+    avg_det_ms: float = 0.0
+    avg_ocr_ms: float = 0.0
+    avg_pose_ms: float = 0.0
 
 
 class LiveDashboard:
@@ -94,6 +97,9 @@ class LiveDashboard:
         s.elapsed_sec = info.elapsed_sec
         s.fps = info.fps
         s.total_detections = info.total_detections
+        s.avg_det_ms = info.avg_det_ms
+        s.avg_ocr_ms = info.avg_ocr_ms
+        s.avg_pose_ms = info.avg_pose_ms
         # Keep crossing counts in sync with pipeline totals
         s.total_crossings = info.total_crossings
         s.unknown_crossings = info.unknown_crossings
@@ -173,6 +179,10 @@ class LiveDashboard:
             f"  Frames:  {s.frame_idx:>8,}",
             f"  Elapsed: {elapsed_m:>4d}:{elapsed_s:02d}",
             f"  FPS:     {s.fps:>8.1f}",
+            "",
+            f"  Det:     {s.avg_det_ms:>5.1f} ms",
+            f"  OCR:     {s.avg_ocr_ms:>5.1f} ms",
+            f"  Pose:    {s.avg_pose_ms:>5.1f} ms",
             "",
             f"  Crossings: {s.total_crossings:>5}",
             f"    Known:   {known:>5}",

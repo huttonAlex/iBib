@@ -10,6 +10,7 @@ import csv
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import itertools
@@ -55,6 +56,7 @@ class PipelineConfig:
     ocr_conf_threshold: float = 0.5
     enable_quality_filter: bool = True
     write_video: bool = True
+    write_raw_video: bool = False
     placement: str = "center"
     timing_line_coords: Optional[Tuple[float, float, float, float]] = None
     crossing_direction: str = "any"
@@ -116,6 +118,7 @@ class PipelineStats:
     unknown_crossings: int
     dedup_suppressed: int
     person_tracks: Optional[int]
+    avg_pose_time_ms: float = 0.0
 
 
 @dataclass
@@ -143,6 +146,9 @@ class ProgressInfo:
     unknown_crossings: int
     total_detections: int
     fps: float
+    avg_det_ms: float = 0.0
+    avg_ocr_ms: float = 0.0
+    avg_pose_ms: float = 0.0
 
 
 def _resolve_device(preferred: Optional[str] = None) -> str:
@@ -165,6 +171,38 @@ def _iter_video_frames(cap: cv2.VideoCapture):
             yield frame
     finally:
         cap.release()
+
+
+class _FramePrefetcher:
+    """Pre-fetch the next frame in a background thread to overlap decode with processing."""
+
+    def __init__(self, frame_iter):
+        self._iter = iter(frame_iter)
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._sentinel = object()
+        self._future = self._pool.submit(next, self._iter, self._sentinel)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        result = self._future.result()
+        if result is self._sentinel:
+            self._pool.shutdown(wait=False)
+            raise StopIteration
+        self._future = self._pool.submit(next, self._iter, self._sentinel)
+        return result
+
+    def shutdown(self):
+        self._pool.shutdown(wait=False)
+
+
+def _timed_pose_detect(detector, frame):
+    """Run pose detection in a thread; returns (detections, elapsed_seconds)."""
+    t0 = time.perf_counter()
+    result = detector.detect(frame)
+    t1 = time.perf_counter()
+    return result, t1 - t0
 
 
 def process_video(
@@ -250,6 +288,7 @@ def process_frames(
     print_summary: bool = True,
     on_crossing: Optional[Callable[[CrossingEvent], None]] = None,
     on_progress: Optional[Callable[[ProgressInfo], None]] = None,
+    on_frame: Optional[Callable[[np.ndarray], None]] = None,
 ) -> PipelineResult:
     """Process an iterable of frames with the full pipeline."""
 
@@ -311,11 +350,17 @@ def process_frames(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_video_path = output_dir / f"{output_stem}_annotated.mp4"
+    raw_video_path = output_dir / f"{output_stem}.mp4"
     out_writer = None
+    raw_writer = None
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     if config.write_video:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out_writer = cv2.VideoWriter(
             str(output_video_path), fourcc, fps, (width, height)
+        )
+    if config.write_raw_video:
+        raw_writer = cv2.VideoWriter(
+            str(raw_video_path), fourcc, fps, (width, height)
         )
 
     log_path = output_dir / f"{output_stem}_detections.csv"
@@ -437,9 +482,18 @@ def process_frames(
 
     wall_start = time.time()
 
-    for frame in frame_iter:
+    # Async frame prefetching: decode next frame while processing current one
+    prefetcher = _FramePrefetcher(frame_iter)
+    # Thread pool for parallel pose detection (runs during tracking/OCR)
+    _pose_pool = ThreadPoolExecutor(max_workers=1) if pose_detector is not None else None
+    should_annotate = config.write_video or show or on_frame is not None
+
+    for frame in prefetcher:
         time_sec = frame_idx / fps
         frame_idx += 1
+
+        if raw_writer:
+            raw_writer.write(frame)
 
         if config.stride > 1 and frame_idx % config.stride != 0:
             continue
@@ -448,6 +502,11 @@ def process_frames(
         dets = detector.detect(frame, config.conf_threshold)
         t1 = time.perf_counter()
         total_det_time += t1 - t0
+
+        # Submit pose detection in parallel — runs during tracking + OCR
+        pose_future: Optional[Future] = None
+        if _pose_pool is not None:
+            pose_future = _pose_pool.submit(_timed_pose_detect, pose_detector, frame)
 
         detections = [d.bbox for d in dets]
         det_confs = [d.confidence for d in dets]
@@ -674,7 +733,7 @@ def process_frames(
                 ]
             )
 
-            if config.write_video or show:
+            if should_annotate:
                 if classified.level == ConfidenceLevel.HIGH:
                     color = (0, 255, 0)
                 elif classified.level == ConfidenceLevel.MEDIUM:
@@ -720,11 +779,9 @@ def process_frames(
                     2,
                 )
 
-        if pose_detector is not None:
-            t_pose_start = time.perf_counter()
-            person_dets = pose_detector.detect(frame)
-            t_pose_end = time.perf_counter()
-            total_pose_time += t_pose_end - t_pose_start
+        if pose_future is not None:
+            person_dets, pose_elapsed = pose_future.result()
+            total_pose_time += pose_elapsed
             total_person_dets += len(person_dets)
 
             p_bboxes = [d.bbox for d in person_dets]
@@ -1000,7 +1057,7 @@ def process_frames(
                 crossing_detector.cleanup(set(person_tracked.keys()))
             person_bib_assoc.cleanup(frame_idx)
 
-            if config.write_video or show:
+            if should_annotate:
                 for pid, (p_centroid, p_bbox) in person_tracked.items():
                     px1, py1, px2, py2 = p_bbox
                     cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 255, 0), 1)
@@ -1059,7 +1116,7 @@ def process_frames(
 
             crossing_detector.cleanup(set(tracked.keys()))
 
-        if timing_line is not None and (config.write_video or show):
+        if timing_line is not None and should_annotate:
             pt1, pt2 = timing_line.to_pixel_coords(width, height)
             cv2.line(frame, pt1, pt2, (255, 0, 255), 2)
 
@@ -1078,6 +1135,9 @@ def process_frames(
         if out_writer:
             out_writer.write(frame)
 
+        if on_frame is not None:
+            on_frame(frame)
+
         if show:
             cv2.imshow("Pipeline Test", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -1088,6 +1148,7 @@ def process_frames(
         if frame_idx > 0 and frame_idx % progress_interval == 0:
             elapsed = time.time() - wall_start
             current_fps = frame_idx / elapsed if elapsed > 0 else 0.0
+            processed = max(frame_idx - start_frame_idx, 1)
             if on_progress is not None:
                 on_progress(
                     ProgressInfo(
@@ -1097,6 +1158,9 @@ def process_frames(
                         unknown_crossings=unknown_crossings,
                         total_detections=total_detections,
                         fps=current_fps,
+                        avg_det_ms=1000 * total_det_time / processed,
+                        avg_ocr_ms=1000 * total_ocr_time / max(total_detections, 1),
+                        avg_pose_ms=1000 * total_pose_time / processed,
                     )
                 )
             elif total_frames:
@@ -1109,6 +1173,11 @@ def process_frames(
                     f"  Frame {frame_idx} | {elapsed:.0f}s elapsed | "
                     f"{total_crossings} crossings"
                 )
+
+    # Cleanup parallel workers
+    prefetcher.shutdown()
+    if _pose_pool is not None:
+        _pose_pool.shutdown(wait=False)
 
     # ------------------------------------------------------------------
     # Post-processing pass: resolve UNKNOWN crossings using global data
@@ -1179,6 +1248,8 @@ def process_frames(
 
     if out_writer:
         out_writer.release()
+    if raw_writer:
+        raw_writer.release()
     log_file.close()
     if crossing_log is not None:
         crossing_log.close()
@@ -1308,6 +1379,7 @@ def process_frames(
         unknown_crossings=unknown_crossings,
         dedup_suppressed=dedup_suppressed,
         person_tracks=person_tracker.next_id if person_tracker is not None else None,
+        avg_pose_time_ms=1000 * total_pose_time / max(frame_idx, 1),
     )
 
     outputs = PipelineOutputs(

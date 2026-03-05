@@ -22,6 +22,127 @@ Entries are organized by phase and date. Each entry should include:
 
 ---
 
+## 2026-03-03: Performance Optimization & CRNN TRT (New Best: 85.2% Recall)
+
+### Motivation
+
+Pipeline was running at **5.2 fps** on Jetson Orin Nano — far below the 30 fps real-time target.
+All inference was sequential (bib detect → OCR → pose detect) and models ran in PyTorch.
+
+### Optimizations Applied
+
+**1. Parallel pose detection** (pipeline.py)
+
+Pose detection (YOLOv8n-pose) is independent of OCR — it only needs the raw frame. Moved to a
+`ThreadPoolExecutor` background thread that runs during tracking + OCR. Saves ~20-40ms/frame
+by overlapping GPU work.
+
+**2. Frame prefetching** (pipeline.py)
+
+Added `_FramePrefetcher` class that pre-reads the next video frame in a background thread while
+the current frame is being processed. Hides video decode latency behind processing time.
+
+**3. TensorRT FP16 export for YOLO models**
+
+Exported both YOLO models to TensorRT FP16 engines on the Jetson:
+
+```bash
+# One-time export (run on Jetson)
+python -c "from ultralytics import YOLO; YOLO('models/bib_detector_v3.pt').export(format='engine', half=True, imgsz=640)"
+python -c "from ultralytics import YOLO; YOLO('yolov8n-pose.pt').export(format='engine', half=True, imgsz=640)"
+```
+
+Engine files: `models/bib_detector_v3.engine` (8.5MB), `yolov8n-pose.engine` (9.5MB).
+
+**4. CRNN TensorRT OCR replacing PARSeq PyTorch**
+
+Switched from PARSeq PyTorch (52.4ms/det) to CRNN via ORT TensorRT EP (10.7ms/det) — **5x
+faster**. PARSeq ONNX is blocked on Jetson due to ORT 1.23.0 Where(9) op incompatibility.
+CRNN TRT uses the existing `models/ocr_crnn.engine` (built from `models/ocr_crnn.onnx` by ORT
+on first run; ~3-4 min warmup, then cached).
+
+**5. Per-stage timing in dashboard**
+
+Added `avg_det_ms`, `avg_ocr_ms`, `avg_pose_ms` fields to `ProgressInfo` and `PipelineStats`.
+The TUI dashboard now displays per-stage latency for live bottleneck identification.
+
+### Speed Results (1000 frames, REC-0004-A.mp4, warmed up)
+
+| Configuration | Eff. FPS | RT Ratio | Det (ms) | OCR (ms/det) | Pose (ms) |
+|---|---|---|---|---|---|
+| Baseline (all PyTorch, sequential) | **5.2** | 0.17x | 42.7 | 52.4 | 44.8 |
+| + parallel pose + prefetch | **6.7** | 0.22x | 39.0 | 60.1 | hidden |
+| + TRT detector | **7.7** | 0.26x | 22.4 | 59.8 | hidden |
+| + TRT detector + TRT pose | **7.9** | 0.26x | 25.0 | 57.7 | hidden |
+| + CRNN TRT OCR, stride=1 | **13.2** | 0.44x | 33.1 | 10.2 | 41.4 |
+| + CRNN TRT OCR, stride=2 | **20.7** | 0.69x | 17.6 | 11.0 | 23.5 |
+| + CRNN TRT OCR, stride=3 | **26.5** | 0.88x | 11.9 | 9.7 | 16.4 |
+
+Per-stage times in stride>1 rows are averaged over all frames (including skipped), so the
+per-processed-frame cost is approximately stride×reported. The actual processing cost per
+processed frame is ~75-96ms regardless of stride.
+
+### Accuracy Results (full REC-0006-A.mp4, ~933 visible finishers)
+
+| Configuration | TP | FP | Precision | Recall |
+|---|---|---|---|---|
+| Run 22: PARSeq PyTorch + .pt detector | 719 | 0 | 100.0% | 77.1% |
+| PARSeq PyTorch + TRT detector | 712 | 0 | 100.0% | 76.3% |
+| **CRNN TRT + TRT detector** | **795** | **1** | **99.9%** | **85.2%** |
+
+**CRNN TRT is better on both speed AND accuracy** — not a tradeoff.
+
+### Why CRNN Beats PARSeq in the Pipeline
+
+Despite PARSeq having higher standalone accuracy (97.0% vs 92.9% on validation set), CRNN
+performs better in the full pipeline context. Root cause: **PARSeq is confidently wrong**.
+
+- PARSeq assigns >0.6 confidence even to incorrect digits (observed in Run 22 digit-correction
+  analysis). These high-confidence wrong reads corrupt temporal voting — the consensus window
+  locks onto incorrect numbers because they arrive with strong confidence.
+- CRNN's errors are more diverse and lower-confidence, allowing the temporal voting + bib
+  validation system to correct them through majority consensus.
+- The per-digit correction infrastructure (Run 22) fired 0 times with PARSeq because wrong
+  digits had confidence >0.6 threshold. CRNN's more distributed error pattern is inherently
+  more correctable by the pipeline's multi-layer validation.
+
+### TRT Detector: Slight Accuracy Regression
+
+The TRT FP16 bib detector loses 7 TP compared to the PyTorch .pt model (712 vs 719 with
+PARSeq). FP16 quantization slightly reduces detection sensitivity. However, CRNN's +83 TP
+gain more than compensates, giving a net +76 TP improvement.
+
+### The "216.333" False Positive
+
+CRNN TRT's sole FP is "216.333" — a decimal point artifact from CRNN's CTC decoding.
+The PostOCRCleanup module should strip non-digit characters; this is a gap in the cleanup
+regex that needs fixing.
+
+### Remaining Gaps
+
+- **~138 visible GT bibs still missing** (933 - 795)
+- **72 UNKNOWN crossings** remain (26 resolved by post-processing)
+- Stride=3 achieves 0.88x real-time; stride=4 likely reaches 1.0x but reduces observation
+  rate to 7.5 fps (may miss fast crossings)
+- Further speed gains possible with INT8 quantization or model distillation
+
+### Production Configuration
+
+```bash
+# Recommended live pipeline command (Jetson Orin Nano)
+python scripts/run_live.py \
+  --source csi \
+  --detector models/bib_detector_v3.engine \
+  --ocr crnn --ocr-backend tensorrt \
+  --pose-model yolov8n-pose.engine \
+  --crossing-mode zone --placement right \
+  --bib-set bibs.txt \
+  --stride 2 \
+  --tui
+```
+
+---
+
 ## 2026-02-24: Pipeline Funnel Diagnostics & Association Fixes (Runs 14-20)
 
 ### Pipeline Funnel Analysis
@@ -66,15 +187,16 @@ crossings to unmatched bibs using temporal+spatial proximity of all sampled bib 
 
 ### Run Comparison
 
-| Metric | Run 14 | Run 17 | Run 20 | Run 22 |
-|---|---|---|---|---|
-| True positives | 634 | 673 | 691 | **719** |
-| False positives | 28 | 24 | 26 | **0** |
-| Precision | 95.8% | 96.6% | 96.4% | **100.0%** |
-| Visible recall | 68.0% | 72.1% | 74.1% | **77.1%** |
-| Person tracks | 2,279 | 2,279 | 2,279 | 2,279 |
-| UNKNOWN crossings | 68 | 96 | 116 | 108 |
-| Post-proc resolved | - | - | 19 | 15 |
+| Metric | Run 14 | Run 17 | Run 20 | Run 22 | CRNN TRT |
+|---|---|---|---|---|---|
+| True positives | 634 | 673 | 691 | 719 | **795** |
+| False positives | 28 | 24 | 26 | 0 | **1** |
+| Precision | 95.8% | 96.6% | 96.4% | 100.0% | **99.9%** |
+| Visible recall | 68.0% | 72.1% | 74.1% | 77.1% | **85.2%** |
+| Person tracks | 2,279 | 2,279 | 2,279 | 2,279 | 2,279 |
+| UNKNOWN crossings | 68 | 96 | 116 | 108 | 72 |
+| Post-proc resolved | - | - | 19 | 15 | 26 |
+| Speed (fps) | ~5 | ~5 | ~5 | ~5 | **~21** |
 
 ### Run 20: Post-proc spatial margin 600→1000px
 
@@ -97,12 +219,12 @@ crossings to unmatched bibs using temporal+spatial proximity of all sampled bib 
 - **Per-digit OCR correction with bib range**: All 435 corrections were single-digit reads ("1"→"5") — partial OCR fragments, not real digit confusions. These bypassed the short-bib penalty by becoming "valid" bibs. Restricted to 3+ digit bibs only.
 - **Per-digit correction with actual bib list (Run 22)**: 0 corrections fired — PARSeq assigns >0.6 confidence even to wrong digits. The threshold (0.6) or approach needs rethinking.
 
-### Remaining Opportunity
+### Remaining Opportunity (superseded by 2026-03-03 CRNN TRT results)
 
-- **~214 visible GT bibs still missing** (933 - 719)
-- **108 UNKNOWN crossings** remain after post-proc (15 resolved)
-- **Per-digit correction infrastructure** is built (`DetailedOCRResult`, `predict_batch_detailed()`) but needs either lower confidence threshold or alternative approach (e.g., per-digit voting weight)
-- Further gains likely require improving the main-loop association, not just post-proc recovery
+- ~~**~214 visible GT bibs still missing** (933 - 719)~~ → Now 138 missing (933 - 795)
+- ~~**108 UNKNOWN crossings** remain~~ → Now 72 UNKNOWN (26 resolved by post-proc)
+- Per-digit correction infrastructure is built but less relevant now that CRNN's error pattern is more naturally corrected by temporal voting
+- See 2026-03-03 entry for current production configuration
 
 ### Key Lessons
 
